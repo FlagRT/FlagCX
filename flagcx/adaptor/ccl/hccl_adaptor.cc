@@ -241,7 +241,8 @@ flagcxResult_t hcclAdaptorBroadcast(const void *sendbuff, void *recvbuff,
   uint32_t rank;
   HcclGetRankId(comm->base, &rank);
   if (rank == root) {
-    aclrtMemcpy(recvbuff, count, sendbuff, count, ACL_MEMCPY_DEVICE_TO_DEVICE);
+    size_t bytes = count * getFlagcxDataTypeSize(datatype);
+    aclrtMemcpy(recvbuff, bytes, sendbuff, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
   }
   void *buffer = (rank == root) ? const_cast<void *>(sendbuff) : recvbuff;
   return (flagcxResult_t)h2f_ret_map[HcclBroadcast(
