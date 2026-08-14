@@ -12,7 +12,10 @@ os.environ.pop('TORCH_DEVICE_BACKEND_AUTOLOAD')
 # If we don't import the Python package first, PyTorch's auto-loader
 # will later try to register the same accelerator again, causing a
 # "Two accelerators cannot be used at the same time" error.
-_DEVICE_BACKENDS = ["torch_npu", "torch_mlu", "torch_musa", "torch_txda", "torch_gcu", "torch_ptpu"]
+# torch_npu intentionally excluded: the ascend adaptor no longer links
+# libtorch_npu.so (it builds against CANN directly), and pre-importing
+# torch_npu would conflict with host runtimes that own the PrivateUse1 key.
+_DEVICE_BACKENDS = ["torch_mlu", "torch_musa", "torch_txda", "torch_gcu", "torch_ptpu"]
 for _pkg in _DEVICE_BACKENDS:
     try:
         __import__(_pkg)

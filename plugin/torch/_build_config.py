@@ -179,24 +179,16 @@ def get_device_config(adaptor_flag):
         library_dirs += ["/opt/kunlun/lib"]
         libs += ["cuda", "cudart", "c10_cuda", "torch_cuda"]
     elif adaptor_flag == "-DUSE_ASCEND_ADAPTOR":
-        import torch_npu
-        pytorch_npu_install_path = os.path.dirname(os.path.abspath(torch_npu.__file__))
-        pytorch_library_path = os.path.join(pytorch_npu_install_path, "lib")
-        # CANN toolkit headers must come BEFORE torch_npu bundled third_party
-        # ACL headers (torch_npu 2.11.0 bundles newer ACL headers incompatible
-        # with CANN 8.5.1).  We also symlink torch_npu's third_party/acl/inc/acl
-        # to CANN's acl/ directory (see install.sh), but adding the CANN include
-        # path here is a belt-and-suspenders fix for hccl.h etc.
-        cann_home = os.environ.get("ASCEND_HOME_PATH", "")
-        if cann_home:
-            import platform as _pf
-            _arch = "aarch64-linux" if _pf.machine().startswith("aarch") else "x86_64-linux"
-            _cann_inc = os.path.join(cann_home, _arch, "include")
-            if os.path.isdir(_cann_inc):
-                include_dirs += [_cann_inc]
-        include_dirs += [os.path.join(pytorch_npu_install_path, "include")]
-        library_dirs += [pytorch_library_path]
-        libs += ["torch_npu"]
+        # Build against the CANN toolkit directly (no torch_npu): the
+        # plugin only needs ACL runtime symbols, and the host runtime
+        # (e.g. torch_fl) supplies the current-stream provider.
+        # NOTE(flagos): upstream version builds against torch_npu; that
+        # conflicts with host runtimes owning the PrivateUse1 key
+        # (torch_fl vs torch_npu), so we decouple here.
+        ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", "/usr/local/Ascend/ascend-toolkit/latest")
+        include_dirs += [os.path.join(ascend_home, "include")]
+        library_dirs += [os.path.join(ascend_home, "lib64")]
+        libs += ["ascendcl"]
     elif adaptor_flag == "-DUSE_AMD_ADAPTOR":
         include_dirs += ["/opt/rocm/include"]
         library_dirs += ["/opt/rocm/lib"]
