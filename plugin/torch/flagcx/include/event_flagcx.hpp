@@ -11,8 +11,8 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <cuda_runtime.h>
 #elif USE_ASCEND_ADAPTOR
-#include "torch_npu/csrc/core/npu/NPUEvent.h"
-#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include <acl/acl_rt.h>
+#include <dlfcn.h>
 #elif USE_ILUVATAR_COREX_ADAPTOR
 #include <ATen/cuda/CUDAEvent.h>
 #include <cuda_runtime.h>
@@ -118,28 +118,51 @@ private:
   at::cuda::CUDAEvent ixcuda_event;
 };
 #elif USE_ASCEND_ADAPTOR
+// Resolve the host runtime's current ACL stream. torch_fl exports
+// GetCurrentStream() (its shared default stream) so FlagCX collectives
+// are ordered with torch ops on the same stream; falls back to a
+// process-wide self-managed stream when the host runtime is absent.
+inline aclrtStream GetFlagcxCurrentAclStream(int device_id) {
+  typedef void *(*GetCurrentStreamFn)(int);
+  static GetCurrentStreamFn get_current_stream = []() -> GetCurrentStreamFn {
+    void *sym = dlsym(RTLD_DEFAULT, "GetCurrentStream");
+    return reinterpret_cast<GetCurrentStreamFn>(sym);
+  }();
+  if (get_current_stream != nullptr) {
+    return static_cast<aclrtStream>(get_current_stream(device_id));
+  }
+  static aclrtStream fallback = []() {
+    aclrtStream s = nullptr;
+    aclrtCreateStream(&s);
+    return s;
+  }();
+  return fallback;
+}
+
 class flagcxCannEvent : public flagcxEvent {
 public:
-  flagcxCannEvent() { npu_event = c10_npu::NPUEvent(); }
+  flagcxCannEvent() { aclrtCreateEvent(&npu_event); }
 
   void record(const int device_id) override {
-    npu_event.record(c10_npu::getCurrentNPUStream(device_id));
+    aclrtRecordEvent(npu_event, GetFlagcxCurrentAclStream(device_id));
   }
 
   void record(const flagcxStream_t &stream, const int device_id) override {
-    npu_event.record(c10_npu::getNPUStreamFromPool(device_id));
+    (void)device_id;
+    aclrtRecordEvent(npu_event, *(aclrtStream *)stream);
   }
 
   void block(const int device_id) override {
-    npu_event.block(c10_npu::getCurrentNPUStream(device_id));
+    aclrtStreamWaitEvent(GetFlagcxCurrentAclStream(device_id), npu_event);
   }
 
   void block(const flagcxStream_t &stream, const int device_id) override {
-    npu_event.block(c10_npu::getNPUStreamFromPool(device_id));
+    (void)device_id;
+    aclrtStreamWaitEvent(*(aclrtStream *)stream, npu_event);
   }
 
 private:
-  c10_npu::NPUEvent npu_event;
+  aclrtEvent npu_event;
 };
 #elif USE_CAMBRICON_ADAPTOR
 class flagcxMluEvent : public flagcxEvent {
