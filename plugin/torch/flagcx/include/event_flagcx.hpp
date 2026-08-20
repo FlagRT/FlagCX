@@ -11,8 +11,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <cuda_runtime.h>
 #elif USE_ASCEND_ADAPTOR
-#include "torch_npu/csrc/core/npu/NPUEvent.h"
-#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include <acl/acl_rt.h>
 #elif USE_ILUVATAR_COREX_ADAPTOR
 #include <ATen/cuda/CUDAEvent.h>
 #include <cuda_runtime.h>
@@ -120,26 +119,33 @@ private:
 #elif USE_ASCEND_ADAPTOR
 class flagcxCannEvent : public flagcxEvent {
 public:
-  flagcxCannEvent() { npu_event = c10_npu::NPUEvent(); }
+  flagcxCannEvent() { aclrtCreateEvent(&event_); }
+  ~flagcxCannEvent() override {
+    if (event_) aclrtDestroyEvent(event_);
+  }
 
   void record(const int device_id) override {
-    npu_event.record(c10_npu::getCurrentNPUStream(device_id));
+    aclrtStream st = nullptr;
+    aclrtCtxGetCurrentDefaultStream(&st);
+    aclrtRecordEvent(event_, st);
   }
 
   void record(const flagcxStream_t &stream, const int device_id) override {
-    npu_event.record(c10_npu::getNPUStreamFromPool(device_id));
+    aclrtRecordEvent(event_, *(aclrtStream *)stream);
   }
 
   void block(const int device_id) override {
-    npu_event.block(c10_npu::getCurrentNPUStream(device_id));
+    aclrtStream st = nullptr;
+    aclrtCtxGetCurrentDefaultStream(&st);
+    aclrtStreamWaitEvent(st, event_);
   }
 
   void block(const flagcxStream_t &stream, const int device_id) override {
-    npu_event.block(c10_npu::getNPUStreamFromPool(device_id));
+    aclrtStreamWaitEvent(*(aclrtStream *)stream, event_);
   }
 
 private:
-  c10_npu::NPUEvent npu_event;
+  aclrtEvent event_ = nullptr;
 };
 #elif USE_CAMBRICON_ADAPTOR
 class flagcxMluEvent : public flagcxEvent {

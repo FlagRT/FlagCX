@@ -337,15 +337,10 @@ flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
     return search->second;
   } else {
     flagcxStreams_[streamId] = nullptr;
-#ifdef USE_ASCEND_ADAPTOR
-    // TODO: The getStreamFromExternal interface is not supported at this stage
-    // on NPU. Adaptation modifications will be made in the future.
-    acl_stream = c10_npu::getCurrentNPUStream().stream(false);
-    flagcxStreams_[streamId] = reinterpret_cast<flagcxStream_t>(&acl_stream);
-#else
+    // FlagOS adaptation: use flagcx device-handle stream creation (ACL-based),
+    // replacing torch_npu's c10_npu stream on Ascend.
     C10D_FLAGCX_CHECK(devHandle_->streamCreate(&flagcxStreams_[streamId]),
                       std::nullopt);
-#endif
     return flagcxStreams_[streamId];
   }
 }
