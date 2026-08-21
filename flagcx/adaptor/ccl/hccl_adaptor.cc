@@ -7,6 +7,19 @@
 #include "comm.h"
 #include <map>
 #include <vector>
+
+// HcclRootInfo is 4108B while flagcxUniqueId is only 256B. Keep the root info
+// in thread-local storage and use the uniqueId buffer merely as a marker.
+// (Kistich: fix for dual-GPU HCCL comm init InvalidArgument)
+static thread_local HcclRootInfo t_hcclRootInfo;
+static thread_local bool t_hasHcclRootInfo = false;
+static thread_local int t_deviceIndex = -1;
+
+// Device handling note: the training script binds each process to its own
+// NPU via torch.flagos.set_device(local_rank) BEFORE HCCL init, so the current
+// ACL context is correct and stable. We must NOT call aclrtSetDevice here:
+// switching the current context after HCCL init invalidates HCCL's internal
+// streams (rtStreamWaitEvent: stream not in current context, 107003).
 std::map<flagcxDataType_t, HcclDataType> f2h_datatype_map = {
     {flagcxInt8, HCCL_DATA_TYPE_INT8},
     {flagcxUint8, HCCL_DATA_TYPE_UINT8},
@@ -76,8 +89,15 @@ flagcxResult_t hcclAdaptorGetVersion(int *version) {
 }
 
 flagcxResult_t hcclAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
-  return (
-      flagcxResult_t)h2f_ret_map[HcclGetRootInfo((HcclRootInfo *)(*uniqueId))];
+  HcclResult ret = HcclGetRootInfo(&t_hcclRootInfo);
+  if (ret != HCCL_SUCCESS) {
+    return (flagcxResult_t)h2f_ret_map[ret];
+  }
+  t_hasHcclRootInfo = true;
+  // flagcxUniqueId(256B) cannot hold HcclRootInfo(4108B); store a marker only.
+  memset((void *)(*uniqueId), 0, sizeof(**uniqueId));
+  memcpy((void *)(*uniqueId), "HCCLROOT", 8);
+  return flagcxSuccess;
 }
 
 flagcxResult_t hcclAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
@@ -97,12 +117,41 @@ const char *hcclAdaptorGetLastError(flagcxInnerComm_t comm) {
 
 flagcxResult_t hcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
-                                       struct bootstrapState * /*bootstrap*/) {
+                                       struct bootstrapState *bootstrap) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
   }
-  return (flagcxResult_t)h2f_ret_map[HcclCommInitRootInfo(
-      nranks, (HcclRootInfo *)commId, rank, &(*comm)->base)];
+  aclrtGetDevice(&t_deviceIndex);
+  HcclRootInfo rootInfo;
+  memset(&rootInfo, 0, sizeof(rootInfo));
+  if (bootstrap != NULL) {
+    // Rank 0 generates the root info (thread-local from GetUniqueId, or fresh)
+    // and broadcasts the full 4108B to every rank over the bootstrap network.
+    if (rank == 0) {
+      if (!t_hasHcclRootInfo) {
+        HcclResult ret = HcclGetRootInfo(&t_hcclRootInfo);
+        if (ret != HCCL_SUCCESS) {
+          return (flagcxResult_t)h2f_ret_map[ret];
+        }
+        t_hasHcclRootInfo = true;
+      }
+      memcpy(&rootInfo, &t_hcclRootInfo, sizeof(HcclRootInfo));
+    }
+    FLAGCXCHECK(bootstrapCollBroadcast(bootstrap, rank, nranks, 0, &rootInfo,
+                                       sizeof(HcclRootInfo)));
+  } else if (t_hasHcclRootInfo) {
+    // No bootstrap available (e.g. single process): reuse thread-local root
+    // info produced by hcclAdaptorGetUniqueId in the same process.
+    memcpy(&rootInfo, &t_hcclRootInfo, sizeof(HcclRootInfo));
+  } else {
+    HcclResult ret = HcclGetRootInfo(&rootInfo);
+    if (ret != HCCL_SUCCESS) {
+      return (flagcxResult_t)h2f_ret_map[ret];
+    }
+  }
+  HcclResult initRet = HcclCommInitRootInfo(nranks, &rootInfo, rank,
+                                   &(*comm)->base);
+  return (flagcxResult_t)h2f_ret_map[initRet];
 }
 
 // TODO: unsupported
@@ -276,9 +325,11 @@ flagcxResult_t hcclAdaptorAllGather(const void *sendbuff, void *recvbuff,
                                     flagcxInnerComm_t comm,
                                     flagcxStream_t stream) {
   void *sendbuffptr = (void *)sendbuff;
-  return (flagcxResult_t)h2f_ret_map[HcclAllGather(
+  HcclResult agRet = HcclAllGather(
       sendbuffptr, recvbuff, sendcount,
-      (HcclDataType)f2h_datatype_map[datatype], comm->base, stream->base)];
+      (HcclDataType)f2h_datatype_map[datatype], comm->base,
+      stream ? stream->base : nullptr);
+  return (flagcxResult_t)h2f_ret_map[agRet];
 }
 
 flagcxResult_t hcclAdaptorAlltoAll(const void *sendbuff, void *recvbuff,

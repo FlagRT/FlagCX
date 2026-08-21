@@ -14,6 +14,10 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+// torch_fl 暴露的当前 stream 切换 API（csrc/runtime/accelerator/ascend/stream_api.cc）
+// 用于让 FlagCX collective 在调用者的当前 stream 上执行（PyTorch 标准语义）。
+extern "C" void *GetCurrentStream(int device_index);
+
 namespace c10d {
 namespace {
 
@@ -332,6 +336,17 @@ flagcxBackend::~flagcxBackend() {
 }
 
 flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
+  if (streamId == 0) {
+    // Kistich: run collectives on the caller's CURRENT stream (PyTorch
+    // semantics) so results are visible to subsequent tensor ops. Using an
+    // internal cached stream breaks happens-before: HcclAllGather submits to
+    // one stream while tensor reads synchronize another -> stale/zero data.
+    // flagcxStream { aclrtStream base; } -> first member is the ACL stream,
+    // so a pointer to our void* storage doubles as a flagcxStream*.
+    static thread_local void *curAclStream = nullptr;
+    curAclStream = GetCurrentStream(deviceId_);
+    return (flagcxStream_t)&curAclStream;
+  }
   if (auto search = flagcxStreams_.find(streamId);
       search != flagcxStreams_.end()) {
     return search->second;
@@ -423,6 +438,10 @@ void flagcxBackend::initComm(at::Device dev) {
         throw std::runtime_error(
             "flagcx communicator was initialized with different device");
       }
+      // Kistich: HCCL collectives require the current ACL device to match the
+      // communicator's device. torch_fl operations (model load, allocator)
+      // may switch the current device away; re-assert it on every collective.
+      C10D_FLAGCX_CHECK(devHandle_->setDevice(deviceId_), std::nullopt);
     }
   }
 }
