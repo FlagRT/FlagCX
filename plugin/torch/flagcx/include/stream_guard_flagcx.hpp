@@ -14,6 +14,10 @@
 #include <cuda_runtime.h>
 #elif USE_ASCEND_ADAPTOR
 #include <acl/acl_rt.h>
+// torch_fl 的当前 stream 获取 API（csrc/runtime/accelerator/ascend/stream_api.cc）。
+// 说明：collective 已通过 getStreamByIndex(0)=GetCurrentStream(device) 运行在调用者
+// 当前 stream 上，无需再切换（libflagos 旧版亦无 SetCurrentStream 导出）。
+extern "C" void *GetCurrentStream(int device_index);
 #elif USE_ILUVATAR_COREX_ADAPTOR
 #include <c10/core/impl/InlineStreamGuard.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -69,7 +73,9 @@ public:
   explicit flagcxStreamGuard() = delete;
   explicit flagcxStreamGuard(flagcxStream_t stream, const int deviceId)
       : originalStream_(stream), currentStream_(nullptr), deviceId_(deviceId),
-#ifdef USE_NVIDIA_ADAPTOR
+#ifdef USE_ASCEND_ADAPTOR
+        prevStream_(GetCurrentStream(deviceId))
+#elif USE_NVIDIA_ADAPTOR
         guard_(
             at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId))
 #elif USE_ILUVATAR_COREX_ADAPTOR
@@ -109,11 +115,16 @@ public:
         guard_(torchpt::get_stream_from_pool(deviceId, /*prio=*/0))
 #endif
   {
-#ifdef USE_SUNRISE_ADAPTOR
+#ifdef USE_ASCEND_ADAPTOR
+    // No-op: collective stream == caller's current stream already.
+    (void)stream;
+#elif USE_SUNRISE_ADAPTOR
     torchpt::set_current_stream(guard_.unwrap());
 #endif
   }
-#ifdef USE_SUNRISE_ADAPTOR
+#ifdef USE_ASCEND_ADAPTOR
+  ~flagcxStreamGuard() = default;
+#elif USE_SUNRISE_ADAPTOR
   // torchpt::PTPUStream is a value type, not an RAII guard, so we have
   // to restore the previous current stream by hand on destruction.
   ~flagcxStreamGuard() {
@@ -155,6 +166,7 @@ public:
         at::cuda::getStreamFromExternal(*(cudaStream_t *)stream, deviceId_));
 #elif USE_ASCEND_ADAPTOR
     guard_ = *(aclrtStream *)stream;
+    (void)guard_;
 #elif USE_AMD_ADAPTOR
     guard_.reset_stream(
         at::hip::getStreamFromExternal(*(hipStream_t *)stream, deviceId_));
@@ -195,6 +207,7 @@ private:
   c10::cuda::CUDAStreamGuard guard_;
 #elif USE_ASCEND_ADAPTOR
   aclrtStream guard_;
+  void *prevStream_;
 #elif USE_AMD_ADAPTOR
   c10::hip::HIPStreamGuard guard_;
 #elif USE_TSM_ADAPTOR

@@ -1897,8 +1897,11 @@ flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
 
   memcpy((void *)commId, (void *)&uniqueIdData[comm->homoRootRank],
          sizeof(flagcxUniqueId));
+  // Pass the bootstrap state so the ccl adaptor can exchange
+  // vendor-specific root info (e.g. 4108B HcclRootInfo) that does not
+  // fit inside the 256B flagcxUniqueId.
   FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
-      homoComm, comm->homoRanks, commId, comm->homoRank, NULL));
+      homoComm, comm->homoRanks, commId, comm->homoRank, state));
   return flagcxSuccess;
 }
 
