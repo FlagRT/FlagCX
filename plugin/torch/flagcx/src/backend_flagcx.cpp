@@ -4,6 +4,8 @@
  * Copyright (c) 2025 by DU. All Rights Reserved.
  ************************************************************************/
 #include "backend_flagcx.hpp"
+#include <dlfcn.h>
+#include <c10/core/DeviceGuard.h>
 #include "utils_flagcx.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -332,6 +334,45 @@ flagcxBackend::~flagcxBackend() {
 }
 
 flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
+#ifdef USE_ASCEND_ADAPTOR
+  // A-line (torch_npu): run collectives on torch_npu's CURRENT stream so
+  // results are visible to subsequent tensor ops on the same stream.
+  // We must NOT link libtorch_npu.so (decoupled build); instead:
+  //   1) dlopen(RTLD_NOLOAD) grabs the already-loaded handle (null if
+  //      torch_npu is absent -> fall through to the torch_fl/self-managed
+  //      fallback below, keeping B-line compatibility);
+  //   2) c10 guardImpl (PrivateUse1) resolves the current c10::Stream;
+  //   3) dlsym'ed c10_npu::NPUStream::stream() converts it to aclrtStream
+  //      (NPUStream's memory starts with its c10::Stream member, so a
+  //      pointer to the c10::Stream doubles as the NPUStream* this).
+  if (streamId == 0) {
+    static void *torchNpuHandle = []() -> void * {
+      return dlopen("libtorch_npu.so", RTLD_LAZY | RTLD_NOLOAD);
+    }();
+    if (torchNpuHandle != nullptr) {
+      using NpuStreamFn = void *(*)(const void *);
+      static NpuStreamFn npuStreamFn = reinterpret_cast<NpuStreamFn>(
+          dlsym(torchNpuHandle, "_ZNK7c10_npu9NPUStream6streamEv"));
+      if (npuStreamFn != nullptr) {
+        try {
+          auto *guardImpl =
+              c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1);
+          c10::Stream cur = guardImpl->getStream(
+              c10::Device(c10::DeviceType::PrivateUse1, deviceId_));
+          static thread_local void *curAclStream = nullptr;
+          curAclStream = npuStreamFn(&cur);
+          // NOTE: NPUStream::stream() returns nullptr for the DEFAULT
+          // stream (ACL semantics: null == default stream). nullptr is a
+          // VALID stream here -- using it keeps collectives ordered with
+          // tensor ops on the default stream.
+          return reinterpret_cast<flagcxStream_t>(&curAclStream);
+        } catch (...) {
+          // PrivateUse1 guard not registered yet; fall back below.
+        }
+      }
+    }
+  }
+#endif
   if (auto search = flagcxStreams_.find(streamId);
       search != flagcxStreams_.end()) {
     return search->second;
