@@ -25,25 +25,35 @@
 - **小模型 DDP**：50M 参数 MLP × 3000 iter，稳定 3.2ms/iter 无退化
 - **通信链路**：bootstrap 广播 RootInfo、HCCS 同节点通信、E_PARA/网卡根因均未复现
 
-## 三、遗留问题（已知缺陷，待下一阶段）
+## 三、遗留问题（已解决，2026-08-24 下午）
 
-**现象**：Qwen2.5-1.5B（1.54B params, bf16）+ DDP + flagcx backend 训练，
-**step ≈ 765 起**每步耗时 0.1s → ~2.4s，rank0 loss 在 1.0000 / 2.0954 间
-精确交替（模型参数停止更新的表象），吞吐从 5032 tok/s 单调下滑。原生
-`backend="hccl"`（torch_npu ProcessGroupHCCL）同脚本训练 2481 步全程健康：
-loss 收敛 1.9472、吞吐稳定 5428 tok/s —— 证明环境/模型/数据无问题，问题
-定位在 **flagcx backend 承载大模型 DDP 负载的路径**。
+**现象（原问题）**：Qwen2.5-1.5B（1.54B params, bf16）+ DDP + flagcx backend 训练，
+**step ≈ 765±20 起**每步耗时 0.1s → ~2.4s，rank0 loss 在固定两个值间精确交替
+（模型参数停止更新的表象），吞吐单调下滑。原生 `backend="hccl"` 同脚本训练
+2481 步全程健康（loss 1.9472、5428 tok/s）。
 
-**已排除**：allgather / allreduce 单原语、小模型 DDP、HBM（23GB/64GB 非 OOM）、
-transformers 版本（与 B 线一致 5.15.1）。
+**根因（源码核查 + 分层实验确认）**：`flagcxCannEvent` 构造时 `aclrtCreateEvent`
+但没有析构函数 → **每次 collective 泄漏一个 aclrtEvent**（DDP 下每步 ~bucket 数
+≈120 个），累积到 ~765 步时 ACL event 资源耗尽：`aclrtCreateEvent` 变慢（每步变慢）
++ event 状态污染（loss 交替）。CUDA 版用 `at::cuda::CUDAEvent`（RAII 自动销毁），
+CANN 版漏了析构。
 
-**疑点方向**：DDP bucket 重建（rebuild_buckets）时的 stream 切换交互；
-长时运行下 `thread_local` stream 缓存与 reducer 内部流的错位；特定
-collective 序列（大 tensor 分桶 + 计算交织）。
+**修复链（commit d296824，逐步收敛）**：
+1. collective 跑在 torch_npu 当前流（guardImpl + dlsym NPUStream::stream()，0686805）
+2. `flagcxWork::wait()` 的 event block 改用 collective 流（不再走自建流 fallback）
+3. future 完成语义：`markCompleted` 前 `event->synchronize()`（PyTorch 2.10 Reducer
+   用 `bucket.future_work->wait()`，必须让 future 完成 == 通信完成）
+4. work 构造 / fn / event record 三处统一为同一次 stream 解析（避免解析间切流错位）
+5. **`~flagcxCannEvent()` 补析构销毁 aclrtEvent（根因修复）**
+
+**验证结果（修复后完整复跑）**：Qwen2.5-1.5B DDP + flagcx backend
+**2481 步全程稳定**：最终 loss **1.9501**（与原生 hccl 1.9472 / B 线 1.9436 相当）、
+吞吐 **4157 tok/s**（原生 hccl 的 ~77%，同步等待语义损失可后续优化）、
+checkpoint 正常保存、进程干净退出。
 
 **诊断资产**（runtime-team `dev/device-context/benchmarks/`）：
-`test_ag_npu.py`（allgather）、`train_qwen_1_5b_npu.py`（训练，hccl/flagcx
-双后端可切换，一行 sed 复现分界实验）。
+`test_ag_npu.py`（allgather）、`test_work_sem.py`（work/future 完成语义实测）、
+`train_qwen_1_5b_npu.py`（训练，hccl/flagcx 双后端可切换，一行 sed 复现分界实验）。
 
 ## 四、路线状态说明
 
