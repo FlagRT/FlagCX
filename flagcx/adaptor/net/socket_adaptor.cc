@@ -305,6 +305,7 @@ flagcxResult_t flagcxNetSocketGetNsockNthread(int dev, int *ns, int *nt) {
 
 flagcxResult_t flagcxNetSocketListen(int dev, void *opaqueHandle,
                                      void **listenComm) {
+  fprintf(stderr, "[HETERO-DBG] SocketListen enter dev=%d\n", dev); fflush(stderr);
   if (dev < 0 ||
       dev >= flagcxNetIfs) { // data transfer socket is based on specified dev
     return flagcxInternalError;
@@ -334,6 +335,7 @@ flagcxResult_t flagcxNetSocketListen(int dev, void *opaqueHandle,
 
 flagcxResult_t flagcxNetSocketConnect(int dev, void *opaqueHandle,
                                       void **sendComm) {
+  fprintf(stderr, "[HETERO-DBG] SocketConnect enter dev=%d\n", dev); fflush(stderr);
   if (dev < 0 ||
       dev >= flagcxNetIfs) { // data transfer socket is based on specified dev
     return flagcxInternalError;
@@ -386,6 +388,7 @@ flagcxResult_t flagcxNetSocketConnect(int dev, void *opaqueHandle,
 }
 
 flagcxResult_t flagcxNetSocketAccept(void *listenComm, void **recvComm) {
+  fprintf(stderr, "[HETERO-DBG] SocketAccept enter\n"); fflush(stderr);
   struct flagcxNetSocketListenComm *lComm =
       (struct flagcxNetSocketListenComm *)listenComm;
   struct flagcxNetSocketCommStage *stage = &lComm->stage;

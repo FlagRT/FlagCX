@@ -1019,6 +1019,7 @@ flagcxResult_t flagcxProxyCallBlocking(struct flagcxHeteroComm *comm,
                                        struct flagcxProxyConnector *proxyConn,
                                        int type, void *reqBuff, int reqSize,
                                        void *respBuff, int respSize) {
+  fprintf(stderr, "[HETERO-DBG] ProxyCallBlocking enter type=%d peer=%d\n", type, proxyConn->tpRank); fflush(stderr);
   // Alloc some memory to act as a handle
   flagcxResult_t res = flagcxSuccess;
   void *opId = malloc(1);
@@ -1092,6 +1093,8 @@ flagcxResult_t flagcxProxyConnect(struct flagcxHeteroComm *comm, int transport,
                                       sizeof(req), &resp, sizeof(resp)));
   proxyConn->connection = resp.connection;
   if (proxyConn->connection == NULL) {
+    fprintf(stderr, "[HETERO-DBG] ProxyConnect NULL conn: rank=%d -> peer=%d transport=%d send=%d\n",
+            comm->rank, proxyRank, transport, send); fflush(stderr);
     WARN("flagcxProxyConnect: service thread returned NULL connection for rank "
          "%d -> peer %d",
          comm->rank, proxyRank);

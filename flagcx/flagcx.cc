@@ -2231,9 +2231,12 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     }
   }
 
-  if ((!useHomoComm(*comm) || useHeteroComm()) && !useHostComm()) {
+  if ((!useHomoComm(*comm) || useHeteroComm()) && !useHostComm() &&
+      (*comm)->heteroComm->topoServer != NULL) {
     // Experimental for multi-nic support
     // Collect nic distance to ranks
+    // Kistich: skip when topo detection is disabled (topoServer == NULL);
+    // otherwise flagcxGetNicDistance dereferences NULL (topo.cc:422 crash).
     (*comm)->clusterInterRankList.resize((*comm)->nclusters);
     struct flagcxNicDistance *nicDistanceData;
     FLAGCXCHECK(flagcxCalloc(&nicDistanceData, nranks));

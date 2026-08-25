@@ -251,8 +251,22 @@ flagcxResult_t cannAdaptorIpcMemHandleFree(flagcxIpcMemHandle_t handle) {
 flagcxResult_t cannAdaptorLaunchHostFunc(flagcxStream_t stream,
                                          void (*fn)(void *), void *args) {
   if (stream != NULL) {
-    DEVCHECK(
-        aclrtLaunchCallback(fn, args, ACL_CALLBACK_NO_BLOCK, stream->base));
+    aclError err =
+        aclrtLaunchCallback(fn, args, ACL_CALLBACK_NO_BLOCK, stream->base);
+    if (err != ACL_SUCCESS) {
+      // Kistich(910C-hetero): callback submit fails with 107015 when the
+      // stream belongs to torch_npu's context but the current thread holds
+      // flagcx's own device context. Degrade to a direct host call: this
+      // only kicks off host-side proxy scheduling; data ordering on the
+      // socket path is enforced by the proxy chunk protocol itself.
+      fprintf(stderr, "[HETERO-DBG] aclrtLaunchCallback failed aclErr=%d, "
+              "fallback to direct host call\n", (int)err);
+      fflush(stderr);
+      fn(args);
+    }
+  } else {
+    // No stream: run the host func directly.
+    fn(args);
   }
   return flagcxSuccess;
 }
@@ -308,6 +322,41 @@ flagcxResult_t cannAdaptorSymMulticastFree(void *) {
   return flagcxNotSupported;
 }
 
+
+// Kistich(910C-hetero): PCI bus id for topology/nic-distance detection in
+// flagcxHeteroCommInitRank. CANN has no direct API; resolve via sysfs, and
+// fall back to a pseudo id derived from the device index when sysfs is not
+// mounted (containers). Socket transport does not depend on precise topo.
+static flagcxResult_t cannAdaptorGetDevicePciBusId(char *pciBusId, int len,
+                                                    int dev) {
+  if (pciBusId == NULL || len < 16) {
+    return flagcxInvalidArgument;
+  }
+  char path[128];
+  snprintf(path, sizeof(path), "/sys/class/davinci%d/device", dev);
+  char *resolved = realpath(path, NULL);
+  if (resolved != NULL) {
+    char *p = resolved, *last = NULL;
+    while ((p = strstr(p, "0000:")) != NULL) {
+      last = p;
+      p += 1;
+    }
+    if (last != NULL) {
+      snprintf(pciBusId, len, "%s", last);
+      char *slash = strchr(pciBusId, '/');
+      if (slash)
+        *slash = '\0';
+      free(resolved);
+      return flagcxSuccess;
+    }
+    free(resolved);
+  }
+  // Fallback pseudo bus id (device index encoded); enough for nic-distance
+  // heuristics over socket transport.
+  snprintf(pciBusId, len, "0000:80:%02x.0", dev);
+  return flagcxSuccess;
+}
+
 struct flagcxDeviceAdaptor cannAdaptor {
   "CANN",
       // Basic functions
@@ -350,8 +399,8 @@ struct flagcxDeviceAdaptor cannAdaptor {
       // Others
       NULL, // flagcxResult_t (*getDeviceProperties)(struct flagcxDevProps
             // *props, int dev);
-      NULL, // flagcxResult_t (*getDevicePciBusId)(char
-            // *pciBusId, int len, int dev);
+      cannAdaptorGetDevicePciBusId, // flagcxResult_t (*getDevicePciBusId)(char
+                                    // *pciBusId, int len, int dev);
       NULL, // flagcxResult_t
             // (*getDeviceByPciBusId)(int
             // *dev, const char *pciBusId);

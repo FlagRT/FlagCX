@@ -252,6 +252,7 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
         int sendPeer = comm->p2pSchedule[round].sendRank;
         while (!flagcxIntruQueueEmpty(&tasks->peers[recvPeer].recvQueue) ||
                !flagcxIntruQueueEmpty(&tasks->peers[sendPeer].sendQueue)) {
+          fprintf(stderr, "[HETERO-DBG] groupLaunch: processing recv task peer=%d\n", recvPeer); fflush(stderr);
           // Process one recv task (for IPC register)
           if (!flagcxIntruQueueEmpty(&tasks->peers[recvPeer].recvQueue)) {
             flagcxTaskP2p *p2p =
@@ -270,6 +271,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                  .proxyConn.connection;
             op->stream = p2p->stream;
             if (op->connection == NULL) {
+              fprintf(stderr, "[HETERO-DBG] groupLaunch recv conn NULL: rank=%d peer=%d ch=%d connected=%d\n",
+                      comm->rank, peer, op->channelId,
+                      comm->channels[op->channelId].peers[peer]->recv[0].connected); fflush(stderr);
               WARN("groupLaunch: recv proxyConn.connection is NULL for rank %d "
                    "peer %d channel %d",
                    comm->rank, peer, op->channelId);
@@ -440,14 +444,17 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     } while (comm != nullptr);
   }
 
+  fprintf(stderr, "[HETERO-DBG] groupLaunch: tasks processed, proxyOps=%zu\n", proxyOps.size()); fflush(stderr);
   // Save all proxy ops in step order
   for (auto it = proxyOps.begin(); it != proxyOps.end(); ++it) {
     for (auto pair : it->second) {
       FLAGCXCHECK(flagcxProxySaveOp(pair.first, pair.second));
     }
   }
+  fprintf(stderr, "[HETERO-DBG] groupLaunch: proxyOps saved\n"); fflush(stderr);
 
   if (launchStream != nullptr && launchEvent != nullptr) {
+    fprintf(stderr, "[HETERO-DBG] groupLaunch: launching kernel (device=%d)\n", deviceAsyncKernel ? 1 : 0); fflush(stderr);
     if (deviceAsyncKernel) {
       FLAGCXCHECK(deviceAdaptor->launchDeviceFunc(
           launchStream, deviceAsyncKernel, (void *)semaphore->getSignals()));
@@ -485,10 +492,17 @@ static flagcxResult_t groupCleanup(struct flagcxAsyncJob *job_) {
       *asyncJobsMain = gjob->asyncJobsPtr;
 
   // clean up preconnect comms
-  while (groupCommPreconnectHeadMain != nullptr) {
+  // Kistich: guard against re-entry / poisoned nodes (preconnectNext == 0x1)
+  while (groupCommPreconnectHeadMain != nullptr &&
+         groupCommPreconnectHeadMain !=
+             reinterpret_cast<struct flagcxHeteroComm *>(0x1)) {
     struct flagcxHeteroComm *comm = groupCommPreconnectHeadMain;
     struct flagcxHeteroComm *next = comm->preconnectNext;
     comm->preconnectNext = reinterpret_cast<struct flagcxHeteroComm *>(0x1);
+    if (next == reinterpret_cast<struct flagcxHeteroComm *>(0x1) ||
+        next == comm) {
+      break; // poisoned or cyclic: stop walking
+    }
     groupCommPreconnectHeadMain = next;
   }
 
@@ -538,6 +552,7 @@ flagcxResult_t flagcxGroupEndInternal() {
 exit:
   return ret;
 fail:
+  fprintf(stderr, "[HETERO-DBG] groupLaunch FAILED ret=%d, cleaning up\n", ret); fflush(stderr);
   groupCleanup(&flagcxGroupJobMainPtr->base);
   groupResetJobState();
   goto exit;
