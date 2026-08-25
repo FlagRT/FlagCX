@@ -1,4 +1,5 @@
 #include "ascend_adaptor.h"
+#include <unordered_set>
 
 #ifdef USE_ASCEND_ADAPTOR
 
@@ -250,23 +251,46 @@ flagcxResult_t cannAdaptorIpcMemHandleFree(flagcxIpcMemHandle_t handle) {
 
 flagcxResult_t cannAdaptorLaunchHostFunc(flagcxStream_t stream,
                                          void (*fn)(void *), void *args) {
-  if (stream != NULL) {
-    aclError err =
-        aclrtLaunchCallback(fn, args, ACL_CALLBACK_NO_BLOCK, stream->base);
-    if (err != ACL_SUCCESS) {
-      // Kistich(910C-hetero): callback submit fails with 107015 when the
-      // stream belongs to torch_npu's context but the current thread holds
-      // flagcx's own device context. Degrade to a direct host call: this
-      // only kicks off host-side proxy scheduling; data ordering on the
-      // socket path is enforced by the proxy chunk protocol itself.
-      fprintf(stderr, "[HETERO-DBG] aclrtLaunchCallback failed aclErr=%d, "
-              "fallback to direct host call\n", (int)err);
-      fflush(stderr);
-      fn(args);
-    }
-  } else {
+  if (stream == NULL || stream->base == nullptr) {
     // No stream: run the host func directly.
     fn(args);
+    return flagcxSuccess;
+  }
+  // Kistich(910C-hetero): ACL callbacks require the stream to be subscribed
+  // to a thread first (aclrtSubscribeReport); otherwise aclrtLaunchCallback
+  // fails with 107015 (ACL_ERROR_RT_STREAM_NO_CB_REG). Subscribe this
+  // stream to the calling thread once, then launch + process the callback
+  // in stream order (aclrtProcessReport blocks until the callback runs at
+  // its stream position -- correct ordering for the host semaphore).
+  static thread_local std::unordered_set<aclrtStream> subscribedStreams;
+  if (subscribedStreams.insert(stream->base).second) {
+    aclError serr = aclrtSubscribeReport((uint64_t)pthread_self(), stream->base);
+    if (serr != ACL_SUCCESS) {
+      fprintf(stderr,
+              "[HETERO-DBG] aclrtSubscribeReport failed aclErr=%d, "
+              "fallback to direct host call\n",
+              (int)serr);
+      fflush(stderr);
+      fn(args);
+      return flagcxSuccess;
+    }
+  }
+  aclError err =
+      aclrtLaunchCallback(fn, args, ACL_CALLBACK_NO_BLOCK, stream->base);
+  if (err != ACL_SUCCESS) {
+    fprintf(stderr,
+            "[HETERO-DBG] aclrtLaunchCallback failed aclErr=%d, "
+            "fallback to direct host call\n",
+            (int)err);
+    fflush(stderr);
+    fn(args);
+    return flagcxSuccess;
+  }
+  // Block until the callback executes (at its stream position).
+  aclError perr = aclrtProcessReport(-1);
+  if (perr != ACL_SUCCESS) {
+    fprintf(stderr, "[HETERO-DBG] aclrtProcessReport aclErr=%d\n", (int)perr);
+    fflush(stderr);
   }
   return flagcxSuccess;
 }
