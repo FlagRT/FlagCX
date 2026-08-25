@@ -4,6 +4,7 @@
  * Copyright (c) 2025 by DU. All Rights Reserved.
  ************************************************************************/
 #include "backend_flagcx.hpp"
+#include <ATen/cuda/CUDAContext.h>
 #include <dlfcn.h>
 #include <c10/core/DeviceGuard.h>
 #include "utils_flagcx.hpp"
@@ -342,6 +343,18 @@ flagcxBackend::~flagcxBackend() {
 }
 
 flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
+#ifdef USE_NVIDIA_ADAPTOR
+  if (streamId == 0) {
+    // 4090 line: run collectives on the CURRENT CUDA stream (PyTorch
+    // semantics) so results are visible to subsequent tensor ops on the
+    // same stream. A self-managed cached stream breaks happens-before:
+    // NCCL submits on one stream while tensor reads synchronize another
+    // -> stale/zero data (same root cause fixed on the ascend line).
+    static thread_local cudaStream_t curCudaStream = nullptr;
+    curCudaStream = at::cuda::getCurrentCUDAStream(deviceId_).stream();
+    return reinterpret_cast<flagcxStream_t>(&curCudaStream);
+  }
+#endif
 #ifdef USE_ASCEND_ADAPTOR
   // A-line (torch_npu): run collectives on torch_npu's CURRENT stream so
   // results are visible to subsequent tensor ops on the same stream.
