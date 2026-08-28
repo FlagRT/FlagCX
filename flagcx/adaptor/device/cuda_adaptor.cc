@@ -5,6 +5,9 @@
 #include "adaptor.h"
 #include "alloc.h"
 #include "param.h"
+// 设备侧 reduce host 封装（实现于 adaptor/kernel/nvidia/flagcx_device_reduce.cu）
+extern "C" void flagcxLaunchReduceSum(void *dst, const void *src, size_t count,
+                           int datatype, void *stream);
 #include <mutex>
 #include <unistd.h>
 #include <unordered_map>
@@ -54,7 +57,10 @@ flagcxResult_t cudaAdaptorDeviceMalloc(void **ptr, size_t size,
                                        flagcxMemType_t type,
                                        flagcxStream_t stream) {
   if (type == flagcxMemHost) {
-    DEVCHECK(cudaHostAlloc(ptr, size, cudaHostAllocMapped));
+    // Kistich(fix-hetero-deadlock): plain pinned (no Mapped) — cudaMemcpy
+    // D2H into cudaHostAllocMapped memory intermittently blocks the proxy
+    // thread on 4090-1 driver. Plain pinned uses the standard D2H path.
+    DEVCHECK(cudaHostAlloc(ptr, size, cudaHostAllocPortable));
   } else if (type == flagcxMemManaged) {
     DEVCHECK(cudaMallocManaged(ptr, size, cudaMemAttachGlobal));
   } else {
@@ -110,6 +116,14 @@ flagcxResult_t cudaAdaptorHostGetDevicePointer(void **pDevice, void *pHost) {
   DEVCHECK(cudaHostGetDevicePointer(pDevice, pHost, 0));
   return flagcxSuccess;
 }
+
+flagcxResult_t cudaAdaptorReduceSum(void *dst, const void *src, size_t count,
+                                    flagcxDataType_t datatype,
+                                    flagcxStream_t stream) {
+  flagcxLaunchReduceSum(dst, src, count, (int)datatype, (void *)stream->base);
+  return flagcxSuccess;
+}
+
 
 flagcxResult_t cudaAdaptorGdrMemAlloc(void **ptr, size_t size,
                                       void *memHandle) {
@@ -952,6 +966,7 @@ struct flagcxDeviceAdaptor cudaAdaptor {
       NULL, // flagcxResult_t (*gdrPtrMmap)(void **pcpuptr, void *devptr, size_t
             // sz);
       NULL, // flagcxResult_t (*gdrPtrMunmap)(void *cpuptr, size_t sz);
+      cudaAdaptorReduceSum,
       // Stream functions
       cudaAdaptorStreamCreate, cudaAdaptorStreamDestroy, cudaAdaptorStreamCopy,
       cudaAdaptorStreamFree, cudaAdaptorStreamSynchronize,

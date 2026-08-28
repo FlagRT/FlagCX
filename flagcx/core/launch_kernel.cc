@@ -74,5 +74,9 @@ void *flagcxDeviceSemaphoreBufferPool::getDevicePtr(int id) {
 void cpuAsyncKernel(void *args) {
   flagcxHostSemaphore *semaphore = (flagcxHostSemaphore *)args;
   semaphore->signalStart();
-  semaphore->wait();
+  // Kistich(fix-hetero-deadlock): never block inside a launchHostFunc
+  // callback. The original semaphore->wait() here spins while the CUDA
+  // driver holds its callback/lock machinery, which blocks the proxy
+  // thread's cudaMemcpyAsync -> op never completes -> wait never returns.
+  // Completion is enforced by the main thread in flagcxGroupLaunch.
 }

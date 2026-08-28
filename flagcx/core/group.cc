@@ -463,6 +463,10 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     } else {
       FLAGCXCHECK(deviceAdaptor->launchHostFunc(launchStream, cpuAsyncKernel,
                                                 (void *)semaphore.get()));
+      // Kistich(fix-hetero-deadlock): the host func only signals the proxy
+      // to start; the main thread enforces completion here. Waiting inside
+      // the host func deadlocks the driver against the proxy thread.
+      semaphore->wait();
     }
   }
 

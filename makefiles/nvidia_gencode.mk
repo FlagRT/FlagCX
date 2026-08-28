@@ -30,7 +30,7 @@ CUDA8_GENCODE   = -gencode=arch=compute_60,code=sm_60 \
 CUDA9_GENCODE   = -gencode=arch=compute_70,code=sm_70
 CUDA10_GENCODE  = -gencode=arch=compute_75,code=sm_75
 CUDA11_GENCODE  = -gencode=arch=compute_80,code=sm_80
-CUDA12_GENCODE  = -gencode=arch=compute_90,code=sm_90
+CUDA12_GENCODE  = -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90
 CUDA12_8_GENCODE = -gencode=arch=compute_100,code=sm_100 \
                    -gencode=arch=compute_120,code=sm_120
 CUDA13_GENCODE  = -gencode=arch=compute_110,code=sm_110

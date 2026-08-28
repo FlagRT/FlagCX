@@ -145,6 +145,11 @@ struct flagcxDeviceAdaptor_latest {
   flagcxResult_t (*hostShareMemFree)(void *ptr, void *memHandle);
   flagcxResult_t (*gdrPtrMmap)(void **pcpuptr, void *devptr, size_t sz);
   flagcxResult_t (*gdrPtrMunmap)(void *cpuptr, size_t sz);
+  // Device-side reduce (Sum) for heterogeneous allreduce: dst += src on
+  // device, avoiding D2H + host reduce + H2D. CANN: aclnnInplaceAdd;
+  // NVIDIA: CUDA kernel in adaptor/kernel/nvidia/flagcx_device_reduce.cu.
+  flagcxResult_t (*reduceSum)(void *dst, const void *src, size_t count,
+                              flagcxDataType_t datatype, flagcxStream_t stream);
   // Stream functions
   flagcxResult_t (*streamCreate)(flagcxStream_t *stream);
   flagcxResult_t (*streamDestroy)(flagcxStream_t stream);

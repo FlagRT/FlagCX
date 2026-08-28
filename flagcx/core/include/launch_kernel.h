@@ -98,7 +98,8 @@ struct flagcxHostSemaphore : public flagcxSemaphore {
   int pollStart(int opId = 0, int step = 0) override {
     auto it = stepInfo.find(opId);
     assert(it != stepInfo.end());
-    return (signals[it->second].first >= step);
+    int cur = __atomic_load_n(&signals[it->second].first, __ATOMIC_ACQUIRE);
+    return (cur >= step);
   }
   int pollEnd() override {
     return (__atomic_load_n(&counter, __ATOMIC_ACQUIRE) == 0);

@@ -9,7 +9,7 @@ DEVICE_INCLUDE := $(DEVICE_HOME)/include $(DEVICE_HOME)/include/cccl
 DEVICE_LINK  := -lcudart -lcuda
 DEVICE_PLATFORM := CUDA
 DEVICE_COMPILER := $(DEVICE_HOME)/bin/nvcc
-DEVICE_COMPILE_FLAG := -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g $(DEVICE_COMPILER_GENCODE)
+DEVICE_COMPILE_FLAG := -std=c++17 -c --cudart=shared -Xcompiler -fPIC -MMD -MP -rdc=true -g $(DEVICE_COMPILER_GENCODE)
 DEVICE_LINK_FLAG := --cudart=shared -Xcompiler -fPIC $(DEVICE_COMPILER_GENCODE)
 DEVICE_FILE_EXTENSION := cu
 

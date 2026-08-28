@@ -118,21 +118,70 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
     return flagcxSuccess;
   }
 
-  // 1) gather all ranks into a temporary device buffer (nranks slices)
-  void *tmpDev = nullptr;
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&tmpDev, bytes * nranks,
-                                          flagcxMemDevice, stream));
-  FLAGCXCHECK(
-      uniRunnerAllGather(sendbuff, tmpDev, count, datatype, comm, stream));
+  // Kistich(fix-oom): slice-bounded temp buffers. The one-shot path
+  // allocated bytes*nranks on EVERY call: on a 24GB card already holding
+  // ~21GB of training state (params + grads + fp32 optimizer states), the
+  // second allreduce's cudaMallocAsync fails silently inside DEVCHECK and
+  // surfaces as flagcxUnhandledDeviceError ("Call to Device function
+  // failed"). Process in slices so the temp footprint stays bounded.
+  size_t sliceBytes = 128 << 20; // 128MB per slice by default
+  const char *sliceEnv = getenv("FLAGCX_HETERO_AR_SLICE_MB");
+  if (sliceEnv) {
+    long sliceMb = atol(sliceEnv);
+    if (sliceMb > 0)
+      sliceBytes = (size_t)sliceMb << 20;
+  }
+  size_t sliceCount = sliceBytes / esize;
+  if (sliceCount == 0)
+    sliceCount = 1;
 
-  // 2) D2H the gathered buffer, then reduce on host
-  char *hostBuf = (char *)malloc(bytes * nranks);
-  if (hostBuf == nullptr)
+  void *tmpDev = nullptr;
+  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&tmpDev, sliceCount * esize * nranks,
+                                          flagcxMemDevice, stream));
+  char *hostBuf = (char *)malloc(sliceCount * esize * nranks);
+  if (hostBuf == nullptr) {
+    FLAGCXCHECK(deviceAdaptor->deviceFree(tmpDev, flagcxMemDevice, stream));
     return flagcxSystemError;
-  FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-      hostBuf, tmpDev, bytes * nranks, flagcxMemcpyDeviceToHost, stream,
-      nullptr));
-  FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
+  }
+
+  for (size_t off = 0; off < count; off += sliceCount) {
+    size_t n = (count - off) < sliceCount ? (count - off) : sliceCount;
+    // 1) gather this slice from all ranks into tmpDev (nranks sub-slices)
+    FLAGCXCHECK(uniRunnerAllGather(
+        (const char *)sendbuff + off * esize, tmpDev, n, datatype, comm,
+        stream));
+    // Kistich(device-reduce-sum): for Sum on fp32/fp16/bf16, reduce directly
+    // on device to avoid D2H + host reduce + H2D. tmpDev holds nranks
+    // sub-slices [rank0..rank{nranks-1}]; copy rank0 into recvbuff then
+    // accumulate the rest on device (aclnnInplaceAdd / CUDA kernel).
+    if (op == flagcxSum &&
+        (datatype == flagcxFloat32 || datatype == flagcxFloat16 ||
+         datatype == flagcxBfloat16)) {
+      // 关键同步：allgather 的 proxy H2D 在独立 cpStream 上，与主线程 commStream
+      // 跨流竞态；streamSynchronize(commStream) 不覆盖 cpStream，必须全设备同步
+      // 确保 tmpDev 的 H2D 完成后再 D2D/kernel 读，否则间歇读到旧数据（sum 错）。
+      FLAGCXCHECK(deviceAdaptor->deviceSynchronize());
+      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+          (char *)recvbuff + off * esize, tmpDev, n * esize,
+          flagcxMemcpyDeviceToDevice, stream, nullptr));
+      for (int r = 1; r < nranks; r++) {
+        FLAGCXCHECK(deviceAdaptor->reduceSum(
+            (char *)recvbuff + off * esize,
+            (const char *)tmpDev + r * n * esize, n, datatype, stream));
+      }
+      FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
+      continue;
+    }
+    // 2) D2H the gathered slice, then reduce on host
+    FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+        hostBuf, tmpDev, n * esize * nranks, flagcxMemcpyDeviceToHost, stream,
+        nullptr));
+    FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
+    {
+      // Shadow count/bytes so the per-dtype reduce switch below (kept
+      // verbatim) operates on the current slice.
+      size_t count = n;
+      size_t bytes = n * esize;
 
 #define FLAGCX_HOST_REDUCE(T, OPNAME, EXPR)                                   \
   do {                                                                        \
@@ -311,9 +360,12 @@ flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
   }
 #undef FLAGCX_HOST_REDUCE
 
-  // 3) H2D the reduced slice
-  FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-      recvbuff, hostBuf, bytes, flagcxMemcpyHostToDevice, stream, nullptr));
+      // 3) H2D the reduced slice (bytes is the shadowed slice size)
+      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+          (char *)recvbuff + off * esize, hostBuf, bytes,
+          flagcxMemcpyHostToDevice, stream, nullptr));
+    } // end slice scope (count/bytes shadow)
+  }   // end slice loop
   free(hostBuf);
   FLAGCXCHECK(deviceAdaptor->deviceFree(tmpDev, flagcxMemDevice, stream));
   return flagcxSuccess;
