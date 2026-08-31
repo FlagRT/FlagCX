@@ -2,6 +2,7 @@
 
 #include "flagcx.h"
 #include "nccl.h"
+#include "flagcx_errors.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <map>
@@ -56,8 +57,13 @@ struct flagcxIpcMemHandle {
 #define DEVCHECK(func)                                                         \
   {                                                                            \
     int ret = func;                                                            \
-    if (ret != cudaSuccess)                                                    \
+    if (ret != cudaSuccess) {                                                  \
+      flagcx::setLastError(flagcxUnhandledDeviceError, (int)ret, __FILE__,     \
+                           __LINE__,                                           \
+                           "device call failed: %s (cudaError %d: %s)", #func, \
+                           (int)ret, cudaGetErrorString((cudaError_t)ret));    \
       return flagcxUnhandledDeviceError;                                       \
+    }                                                                          \
   }
 
 #endif // USE_NVIDIA_ADAPTOR

@@ -9,6 +9,7 @@
 
 #include "debug.h"
 #include "type.h"
+#include "flagcx_errors.h"
 #include <errno.h>
 
 // Check system calls
@@ -100,6 +101,8 @@
       /* Print the back trace*/                                                \
       if (flagcxDebugNoWarn == 0)                                              \
         INFO(FLAGCX_ALL, "%s:%d -> %d", __FILE__, __LINE__, RES);              \
+      flagcx::setLastError(RES, 0, __FILE__, __LINE__, "check failed: %s",     \
+                           #call);                                              \
       return RES;                                                              \
     }                                                                          \
   } while (0);
@@ -111,6 +114,8 @@
       /* Print the back trace*/                                                \
       if (flagcxDebugNoWarn == 0)                                              \
         INFO(FLAGCX_ALL, "%s:%d -> %d", __FILE__, __LINE__, RES);              \
+      flagcx::setLastError(RES, 0, __FILE__, __LINE__, "check failed: %s",     \
+                           #call);                                              \
       goto label;                                                              \
     }                                                                          \
   } while (0);

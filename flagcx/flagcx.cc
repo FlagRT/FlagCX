@@ -1,5 +1,6 @@
 #include "flagcx.h"
 #include "adaptor.h"
+#include "flagcx_errors.h"
 #include "adaptor_plugin_load.h"
 #include "alloc.h"
 #include "bootstrap.h"
@@ -1583,19 +1584,45 @@ flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t uniqueId) {
 }
 
 const char *flagcxGetErrorString(flagcxResult_t result) {
-  // TODO: implement a method to retrieve error string
-  return "Not implemented.";
+  switch (result) {
+  case flagcxSuccess:
+    return "Success";
+  case flagcxUnhandledDeviceError:
+    return "Unhandled device error (see flagcxGetLastError)";
+  case flagcxSystemError:
+    return "System error (errno)";
+  case flagcxInternalError:
+    return "Internal error";
+  case flagcxInvalidArgument:
+    return "Invalid argument";
+  case flagcxInvalidUsage:
+    return "Invalid usage";
+  case flagcxRemoteError:
+    return "Remote error";
+  case flagcxInProgress:
+    return "In progress";
+  case flagcxUnhandledCCLError:
+    return "Unhandled CCL error";
+  case flagcxNotSupported:
+    return "Not supported";
+  default:
+    return "Unknown flagcx error";
+  }
 }
 
 const char *flagcxGetLastError(flagcxComm_t comm) {
-  // TODO: implement a method to retrieve last error string
+  // 优先返回线程局部最近一次错误（含文件:行/厂商错误码），由 DEVCHECK /
+  // FLAGCXCHECK 在失败时写入（flagcx_errors.h）。
+  if (flagcx::tlsErrorSet) {
+    return flagcx::tlsLastError.msg;
+  }
   if (comm == NULL) {
-    return "Undefined: flagcxComm is not fully initialized.";
+    return "flagcx: no error recorded (comm is not initialized)";
   }
   if (useHomoComm(comm)) {
     return cclAdaptors[flagcxCCLAdaptorDevice]->getLastError(comm->homoComm);
   }
-  return "Not implemented.";
+  return "flagcx: no error recorded";
 }
 
 // ---- Custom op DevComm state init/destroy ----
