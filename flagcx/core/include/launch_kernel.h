@@ -24,6 +24,9 @@ struct flagcxSemaphore {
   virtual ~flagcxSemaphore() = default;
 
   virtual flagcxEvent_t getEvent() = 0;
+  // O4: proxy 检测到错误时置位，wait() 提前退出（HostSemaphore 实现）
+  virtual void setError() {}
+  virtual int hasError() { return 0; }
   virtual void signalStart() = 0;
   virtual void *getSignals() = 0;
   virtual void subCounter(int opId = 0) = 0;
@@ -47,10 +50,12 @@ struct flagcxHostSemaphore : public flagcxSemaphore {
   std::vector<std::pair<int, int>> signals; // [curStep, nSteps]
   std::vector<flagcxEvent_t> events;
   bool frozen; // true during execution phase
+  int error;   // O4: proxy 检测到协议错误后置位，wait() 提前退出
 
   flagcxHostSemaphore() {
     counter = 0;
     frozen = false;
+    error = 0;
     stepInfo.reserve(FLAGCX_OPS_PER_SEMAPHORE);
     signals.reserve(FLAGCX_SIGNALS_PER_SEMAPHORE);
     events.reserve(FLAGCX_SIGNALS_PER_SEMAPHORE);
@@ -104,10 +109,16 @@ struct flagcxHostSemaphore : public flagcxSemaphore {
   int pollEnd() override {
     return (__atomic_load_n(&counter, __ATOMIC_ACQUIRE) == 0);
   }
+  // O4: proxy 检测到协议/设备错误时置位，wait() 提前退出（暴露而非卡死）
+  void setError() { __atomic_store_n(&error, 1, __ATOMIC_RELEASE); }
+  int hasError() { return __atomic_load_n(&error, __ATOMIC_ACQUIRE); }
   void wait() override {
     int nDone = 0;
     int nOps = __atomic_load_n(&counter, __ATOMIC_ACQUIRE);
     while (nDone < nOps) {
+      if (__atomic_load_n(&error, __ATOMIC_ACQUIRE)) {
+        break; // O4: 错误终结——不再等待未完成 op
+      }
       for (auto it = stepInfo.begin(); it != stepInfo.end(); ++it) {
         if (__atomic_load_n(&signals[it->second].first, __ATOMIC_ACQUIRE) ==
             __atomic_load_n(&signals[it->second].second, __ATOMIC_ACQUIRE)) {

@@ -90,7 +90,6 @@ static flagcxResult_t fillPeerInfo(flagcxHeteroComm_t comm,
 static flagcxResult_t initTransportsRank(flagcxHeteroComm_t comm,
                                          flagcxHeteroComm_t parent) {
   INFO(FLAGCX_INIT, "inside initTransportsRank");
-  fprintf(stderr, "[HETERO-DBG] rank=%d inside initTransportsRank\n", comm->rank); fflush(stderr);
   flagcxResult_t ret = flagcxSuccess;
   int rank = comm->rank;
   int nranks = comm->nRanks;
@@ -102,16 +101,13 @@ static flagcxResult_t initTransportsRank(flagcxHeteroComm_t comm,
   FLAGCXCHECKGOTO(fillPeerInfo(comm, comm->peerInfo + rank, comm->commHash),
                   ret, fail);
   // Question: where did we initialize comm->bootstrap?
-  fprintf(stderr, "[HETERO-DBG] rank=%d before bootstrapAllGather peerInfo\n", comm->rank); fflush(stderr);
   INFO(FLAGCX_INIT, "start bootstrapAllGather for peerInfo");
   FLAGCXCHECKGOTO(bootstrapCollAllGather(comm->bootstrap,
                                          (void *)comm->peerInfo,
                                          sizeof(struct flagcxPeerInfo)),
                   ret, fail);
-  fprintf(stderr, "[HETERO-DBG] rank=%d peerInfo allgather done, before barrier\n", comm->rank); fflush(stderr);
   FLAGCXCHECKGOTO(bootstrapCollBarrier(comm->bootstrap, rank, nranks, 0), ret,
                   fail);
-  fprintf(stderr, "[HETERO-DBG] rank=%d barrier done\n", comm->rank); fflush(stderr);
 
   // check for duplicate GPUs
   INFO(FLAGCX_INIT, "start check for duplicate GPUs");
@@ -284,13 +280,11 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
     // New version of calling bootstrapInit
     uint64_t magic = ((struct flagcxBootstrapHandle *)&job->commId)->magic;
     comm->magic = magic;
-    fprintf(stderr, "[HETERO-DBG] rank=%d before bootstrapCollInit\n", comm->rank); fflush(stderr);
     FLAGCXCHECKGOTO(
         bootstrapCollInit((struct flagcxBootstrapHandle *)&job->commId,
                           comm->rank, comm->nRanks, magic, comm->abortFlag,
                           &comm->bootstrap),
         res, fail);
-    fprintf(stderr, "[HETERO-DBG] rank=%d bootstrapCollInit OK\n", comm->rank); fflush(stderr);
   }
 
   if (!job->parent) {
@@ -360,23 +354,17 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
   assert(flagcxNetChunks <= FLAGCX_NET_MAX_STEPS);
   assert(flagcxP2pChunks <= FLAGCX_P2P_MAX_STEPS);
 
-  fprintf(stderr, "[HETERO-DBG] rank=%d before flagcxNetInit\n", comm->rank); fflush(stderr);
   FLAGCXCHECK(flagcxNetInit(comm));
-  fprintf(stderr, "[HETERO-DBG] rank=%d flagcxNetInit OK\n", comm->rank); fflush(stderr);
   INFO(FLAGCX_INIT, "Using network %s", comm->netAdaptor->name);
-  fprintf(stderr, "[HETERO-DBG] rank=%d before getBusId\n", comm->rank); fflush(stderr);
   INFO(FLAGCX_INIT, "getting busId for cudaDev %d", comm->cudaDev);
   FLAGCXCHECK(getBusId(comm->cudaDev, &comm->busId));
-  fprintf(stderr, "[HETERO-DBG] rank=%d getBusId OK busId=%lx\n", comm->rank, (unsigned long)comm->busId); fflush(stderr);
   INFO(FLAGCX_INIT, "getting commHash for rank %d", comm->rank);
   comm->commHash = getHash(job->commId.internal, FLAGCX_UNIQUE_ID_BYTES);
   INFO(FLAGCX_INIT, "commHash for rank %d is %lu", comm->rank, comm->commHash);
   // TODO: put net init into a separate function
 
-  fprintf(stderr, "[HETERO-DBG] rank=%d before initTransportsRank\n", comm->rank); fflush(stderr);
   INFO(FLAGCX_INIT, "start initTransportsRank");
   FLAGCXCHECKGOTO(initTransportsRank(comm, NULL), res, fail);
-  fprintf(stderr, "[HETERO-DBG] rank=%d initTransportsRank OK\n", comm->rank); fflush(stderr);
 
 exit:
   return res;

@@ -266,11 +266,6 @@ flagcxResult_t cannAdaptorLaunchHostFunc(flagcxStream_t stream,
   if (subscribedStreams.insert(stream->base).second) {
     aclError serr = aclrtSubscribeReport((uint64_t)pthread_self(), stream->base);
     if (serr != ACL_SUCCESS) {
-      fprintf(stderr,
-              "[HETERO-DBG] aclrtSubscribeReport failed aclErr=%d, "
-              "fallback to direct host call\n",
-              (int)serr);
-      fflush(stderr);
       fn(args);
       return flagcxSuccess;
     }
@@ -278,20 +273,12 @@ flagcxResult_t cannAdaptorLaunchHostFunc(flagcxStream_t stream,
   aclError err =
       aclrtLaunchCallback(fn, args, ACL_CALLBACK_NO_BLOCK, stream->base);
   if (err != ACL_SUCCESS) {
-    fprintf(stderr,
-            "[HETERO-DBG] aclrtLaunchCallback failed aclErr=%d, "
-            "fallback to direct host call\n",
-            (int)err);
-    fflush(stderr);
     fn(args);
     return flagcxSuccess;
   }
   // Block until the callback executes (at its stream position).
   aclError perr = aclrtProcessReport(-1);
-  if (perr != ACL_SUCCESS) {
-    fprintf(stderr, "[HETERO-DBG] aclrtProcessReport aclErr=%d\n", (int)perr);
-    fflush(stderr);
-  }
+  (void)perr;
   return flagcxSuccess;
 }
 

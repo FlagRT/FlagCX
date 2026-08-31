@@ -218,7 +218,7 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
     if (args->transmitted < args->posted) {
       void *req = args->subs[args->transmitted & stepMask].requests[0];
       int done = 0, sizes;
-      resources->netAdaptor->test(req, &done, &sizes);
+      FLAGCXCHECK(resources->netAdaptor->test(req, &done, &sizes));
       if (done) {
         args->transmitted++;
       }
@@ -272,7 +272,7 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
     if (args->postFlush < args->posted) {
       void *req = args->subs[args->postFlush & stepMask].requests[0];
       int done = 0, sizes;
-      resources->netAdaptor->test(req, &done, &sizes);
+      FLAGCXCHECK(resources->netAdaptor->test(req, &done, &sizes));
       if (done) {
         if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
           void *req = NULL;
@@ -316,7 +316,7 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
         done = 1;
         sizes = 0;
       } else {
-        resources->netAdaptor->test(req, &done, &sizes);
+        FLAGCXCHECK(resources->netAdaptor->test(req, &done, &sizes));
       }
       if (done) {
         if (!args->regBufFlag) {
