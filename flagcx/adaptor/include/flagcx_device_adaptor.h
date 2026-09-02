@@ -250,6 +250,16 @@ struct flagcxDeviceAdaptor_latest {
   flagcxResult_t (*symMulticastFree)(void *mcHandle);
 
   flagcxResult_t (*getLastError)();
+
+  // Persistent collective kernel launch for the DAG engine (uniRunner).
+  // Launches the FIFO consumer that spins on the FIFO until terminate is set.
+  // CUDA: flagcxCollectiveKernel<<<>>> (async); Ascend: aclnnFlagcxCollective
+  // (async, kernel persists). NULL if the platform has no persistent-kernel
+  // path — callers then keep the legacy CUDA launch (behavior unchanged).
+  // Added after getLastError so positional initializers in existing adaptors
+  // leave it zero-initialized (NULL) without source changes.
+  flagcxResult_t (*launchCollectiveKernel)(void *fifoBuffer, size_t nthreads,
+                                           size_t nblocks, void *stream);
 };
 
 #define flagcxDeviceAdaptor flagcxDeviceAdaptor_latest

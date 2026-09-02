@@ -93,282 +93,331 @@ flagcxResult_t uniRunnerBroadcast(const void *sendbuff, void *recvbuff,
   return flagcxSuccess;
 }
 
+// Forward declaration: the P8 plain-path fallback below calls uniRunnerAllGather
+// whose definition appears later in this file (Send/Recv naive allgather).
 flagcxResult_t uniRunnerAllGather(const void *sendbuff, void *recvbuff,
                                   size_t sendcount, flagcxDataType_t datatype,
                                   flagcxComm_t comm, flagcxStream_t stream);
+
+#if defined(FLAGCX_USE_ASCEND_DAG)
+// #8 Ascend DAG capability probe cache (once per process):
+//   -1 = not probed; 1 = DAG available (.run installed + launch ok);
+//   0 = unavailable (degrade to P8 plain path).
+// Probe = a real first DAG run: capability loss (.run not installed /
+// GetWorkspaceSize failure) surfaces at launch time, leaves no persistent
+// kernel behind, so cleanupUniRunner is safe.
+static int ascendDagProbe = -1;
+#endif
 
 flagcxResult_t uniRunnerAllReduce(const void *sendbuff, void *recvbuff,
                                   size_t count, flagcxDataType_t datatype,
                                   flagcxRedOp_t op, flagcxComm_t comm,
                                   flagcxStream_t stream) {
-  // Kistich(hetero-fallback): the DAG engine (initUniRunner) requires UVA
-  // (device access to host fifo via hostGetDevicePointer, NULL on CANN —
-  // Ascend has no UVA). Degrade to the plain path: allgather (Send/Recv,
-  // verified working) + host reduce + H2D copy. Correctness over speed.
-  size_t esize = getFlagcxDataTypeSize(datatype);
-  size_t bytes = count * esize;
-  int nranks = comm->nranks;
-
-  if (nranks == 1 || count == 0) {
-    if (sendbuff != recvbuff && count > 0) {
-      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-          recvbuff, const_cast<void *>(sendbuff), bytes,
-          flagcxMemcpyDeviceToDevice, stream, nullptr));
+#if defined(FLAGCX_USE_ASCEND_DAG)
+  // ---------- Ascend: #8 DAG first + runtime probe, auto degrade to P8 ----------
+  if (ascendDagProbe != 0) {
+    flagcxResult_t res = flagcxSuccess;
+    flagcxHeteroComm_t hcomm = comm->heteroComm;
+    flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+    FLAGCXCHECKGOTO(initUniRunner(comm, stream), res, plain);
+    if (flagcxParamUniRunnerUseLocRed()) {
+      /* initialize uniRunnerState for reduce test */
+      FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff,
+                                               count, datatype, op, comm),
+                      res, dag_cleanup);
+    } else if (flagcxParamUniRunnerUseRingAG()) {
+      /* initialize uniRunnerState for p2p test */
+      FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff,
+                                               count, datatype, op, comm),
+                      res, dag_cleanup);
+    } else if (flagcxParamUniRunnerUseSlicedAR()) {
+      /* initialize uniRunnerState for sliced AllReduce */
+      FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
+                                                 count, datatype, op, comm),
+                      res, dag_cleanup);
+    } else {
+      /* initialize uniRunnerState for ring AllReduce */
+      FLAGCXCHECKGOTO(initUniRunnerStateRingAR(runnerState, sendbuff, recvbuff,
+                                               count, datatype, op, comm),
+                      res, dag_cleanup);
     }
+    FLAGCXCHECKGOTO(runUniRunner(comm), res, dag_cleanup);
+  dag_cleanup:
+    FLAGCXCHECK(cleanupUniRunner(comm));
+    if (res == flagcxSuccess) {
+      if (ascendDagProbe < 0) ascendDagProbe = 1;
+      return flagcxSuccess;
+    }
+    if (ascendDagProbe < 0) ascendDagProbe = 0;
+    WARN("uniRunnerAllReduce: DAG path failed (%d) - degrade to plain path (P8)",
+         (int)res);
+  }
+plain:
+  // ---------- P8 plain path (Kistich fallback, verified on 910C) ----------
+  // The DAG engine (initUniRunner) needs UVA (device access to host fifo via
+  // hostGetDevicePointer) + a persistent consumer kernel; when either is
+  // missing at runtime we degrade here: allgather (Send/Recv, verified
+  // working) + host reduce + H2D copy. Correctness over speed.
+  {
+    size_t esize = getFlagcxDataTypeSize(datatype);
+    size_t bytes = count * esize;
+    int nranks = comm->nranks;
+
+    if (nranks == 1 || count == 0) {
+      if (sendbuff != recvbuff && count > 0) {
+        FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+            recvbuff, const_cast<void *>(sendbuff), bytes,
+            flagcxMemcpyDeviceToDevice, stream, nullptr));
+      }
+      return flagcxSuccess;
+    }
+
+    // slice-bounded temp buffers: the one-shot path allocated bytes*nranks
+    // on EVERY call; on a 24GB card already holding ~21GB of training state
+    // the second allreduce's allocation fails silently inside DEVCHECK and
+    // surfaces as flagcxUnhandledDeviceError. Process in slices so the temp
+    // footprint stays bounded (128MB/slice default, FLAGCX_HETERO_AR_SLICE_MB
+    // configurable).
+    size_t sliceBytes = 128 << 20; // 128MB per slice by default
+    const char *sliceEnv = getenv("FLAGCX_HETERO_AR_SLICE_MB");
+    if (sliceEnv) {
+      long sliceMb = atol(sliceEnv);
+      if (sliceMb > 0) sliceBytes = (size_t)sliceMb << 20;
+    }
+    size_t sliceCount = sliceBytes / esize;
+    if (sliceCount == 0) sliceCount = 1;
+
+    void *tmpDev = nullptr;
+    FLAGCXCHECK(deviceAdaptor->deviceMalloc(&tmpDev, sliceCount * esize * nranks,
+                                            flagcxMemDevice, stream));
+    char *hostBuf = (char *)malloc(sliceCount * esize * nranks);
+    if (hostBuf == nullptr) {
+      FLAGCXCHECK(deviceAdaptor->deviceFree(tmpDev, flagcxMemDevice, stream));
+      return flagcxSystemError;
+    }
+
+    for (size_t off = 0; off < count; off += sliceCount) {
+      size_t n = (count - off) < sliceCount ? (count - off) : sliceCount;
+      // 1) gather this slice from all ranks into tmpDev (nranks sub-slices)
+      FLAGCXCHECK(uniRunnerAllGather(
+          (const char *)sendbuff + off * esize, tmpDev, n, datatype, comm,
+          stream));
+      // 2) D2H the gathered slice, then reduce on host
+      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+          hostBuf, tmpDev, n * esize * nranks, flagcxMemcpyDeviceToHost, stream,
+          nullptr));
+      FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
+      {
+        // Shadow count/bytes so the per-dtype reduce switch below (kept
+        // verbatim) operates on the current slice.
+        size_t count = n;
+        size_t bytes = n * esize;
+
+        for (int r = 1; r < nranks; r++) {
+          char *slice = hostBuf + r * bytes;
+          switch (datatype) {
+          case flagcxFloat32: {
+            float *dst = (float *)hostBuf;
+            const float *src = (const float *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxProd) dst[i] *= src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxFloat64: {
+            double *dst = (double *)hostBuf;
+            const double *src = (const double *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxProd) dst[i] *= src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxBfloat16: {
+            uint16_t *dst = (uint16_t *)hostBuf;
+            const uint16_t *src = (const uint16_t *)slice;
+            auto bf2f = [](uint16_t v) -> float {
+              uint32_t u = ((uint32_t)(v & 0x8000)) << 16 |
+                           ((uint32_t)(v & 0x7fff)) << 16;
+              return *((float *)&u);
+            };
+            auto f2bf = [](float f) -> uint16_t {
+              uint32_t u = *((uint32_t *)&f);
+              uint32_t lsb = (u >> 16) & 1;
+              uint16_t r = (uint16_t)((u >> 16) + lsb);
+              return r;
+            };
+            for (size_t i = 0; i < count; i++) {
+              float a = bf2f(dst[i]), b = bf2f(src[i]);
+              float v;
+              if (op == flagcxSum) v = a + b;
+              else if (op == flagcxProd) v = a * b;
+              else if (op == flagcxMax) v = a > b ? a : b;
+              else if (op == flagcxMin) v = a < b ? a : b;
+              else v = a;
+              dst[i] = f2bf(v);
+            }
+            break;
+          }
+          case flagcxFloat16: {
+            uint16_t *dst = (uint16_t *)hostBuf;
+            const uint16_t *src = (const uint16_t *)slice;
+            auto h2f = [](uint16_t h) -> float {
+              uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, frac = h & 0x3ff;
+              uint32_t u;
+              if (exp == 0)
+                u = (sign << 31) | (frac << 13);
+              else if (exp == 31)
+                u = (sign << 31) | 0x7f800000 | (frac << 13);
+              else
+                u = (sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13);
+              return *((float *)&u);
+            };
+            auto f2h = [](float f) -> uint16_t {
+              uint32_t u = *((uint32_t *)&f);
+              uint32_t sign = (u >> 31) & 1, exp = (u >> 23) & 0xff, frac = u & 0x7fffff;
+              uint16_t h;
+              if (exp == 0xff)
+                h = (uint16_t)((sign << 15) | 0x7c00 | (frac ? 1 : 0));
+              else {
+                int32_t e = (int32_t)exp - 127 + 15;
+                if (e <= 0)
+                  h = (uint16_t)(sign << 15);
+                else if (e >= 31)
+                  h = (uint16_t)((sign << 15) | 0x7c00);
+                else
+                  h = (uint16_t)((sign << 15) | (e << 10) | (frac >> 13));
+              }
+              return h;
+            };
+            for (size_t i = 0; i < count; i++) {
+              float a = h2f(dst[i]), b = h2f(src[i]);
+              float v;
+              if (op == flagcxSum) v = a + b;
+              else if (op == flagcxProd) v = a * b;
+              else if (op == flagcxMax) v = a > b ? a : b;
+              else if (op == flagcxMin) v = a < b ? a : b;
+              else v = a;
+              dst[i] = f2h(v);
+            }
+            break;
+          }
+          case flagcxInt64: {
+            int64_t *dst = (int64_t *)hostBuf;
+            const int64_t *src = (const int64_t *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxProd) dst[i] *= src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxUint64: {
+            uint64_t *dst = (uint64_t *)hostBuf;
+            const uint64_t *src = (const uint64_t *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxProd) dst[i] *= src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxInt32: {
+            int32_t *dst = (int32_t *)hostBuf;
+            const int32_t *src = (const int32_t *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxProd) dst[i] *= src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxUint32: {
+            uint32_t *dst = (uint32_t *)hostBuf;
+            const uint32_t *src = (const uint32_t *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxProd) dst[i] *= src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxInt8: {
+            int8_t *dst = (int8_t *)hostBuf;
+            const int8_t *src = (const int8_t *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          case flagcxUint8: {
+            uint8_t *dst = (uint8_t *)hostBuf;
+            const uint8_t *src = (const uint8_t *)slice;
+            for (size_t i = 0; i < count; i++) {
+              if (op == flagcxSum) dst[i] += src[i];
+              else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+              else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
+            }
+            break;
+          }
+          default:
+            free(hostBuf);
+            return flagcxInvalidArgument;
+          }
+        }
+        // 3) H2D the reduced slice (bytes is the shadowed slice size)
+        FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+            (char *)recvbuff + off * esize, hostBuf, bytes,
+            flagcxMemcpyHostToDevice, stream, nullptr));
+      } // end slice scope (count/bytes shadow)
+    }   // end slice loop
+    free(hostBuf);
+    FLAGCXCHECK(deviceAdaptor->deviceFree(tmpDev, flagcxMemDevice, stream));
     return flagcxSuccess;
   }
-
-  // Kistich(fix-oom): slice-bounded temp buffers. The one-shot path
-  // allocated bytes*nranks on EVERY call: on a 24GB card already holding
-  // ~21GB of training state (params + grads + fp32 optimizer states), the
-  // second allreduce's cudaMallocAsync fails silently inside DEVCHECK and
-  // surfaces as flagcxUnhandledDeviceError ("Call to Device function
-  // failed"). Process in slices so the temp footprint stays bounded.
-  size_t sliceBytes = 128 << 20; // 128MB per slice by default
-  const char *sliceEnv = getenv("FLAGCX_HETERO_AR_SLICE_MB");
-  if (sliceEnv) {
-    long sliceMb = atol(sliceEnv);
-    if (sliceMb > 0)
-      sliceBytes = (size_t)sliceMb << 20;
+#else
+  // ---------- other platforms: original DAG logic (unchanged) ----------
+  flagcxResult_t res = flagcxSuccess;
+  flagcxHeteroComm_t hcomm = comm->heteroComm;
+  flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
+  FLAGCXCHECK(initUniRunner(comm, stream));
+  if (flagcxParamUniRunnerUseLocRed()) {
+    /* initialize uniRunnerState for reduce test */
+    FLAGCXCHECKGOTO(initUniRunnerStateLocRed(runnerState, sendbuff, recvbuff,
+                                             count, datatype, op, comm),
+                    res, out);
+  } else if (flagcxParamUniRunnerUseRingAG()) {
+    /* initialize uniRunnerState for p2p test */
+    FLAGCXCHECKGOTO(initUniRunnerStateRingAG(runnerState, sendbuff, recvbuff,
+                                             count, datatype, op, comm),
+                    res, out);
+  } else if (flagcxParamUniRunnerUseSlicedAR()) {
+    /* initialize uniRunnerState for sliced AllReduce */
+    FLAGCXCHECKGOTO(initUniRunnerStateSlicedAR(runnerState, sendbuff, recvbuff,
+                                               count, datatype, op, comm),
+                    res, out);
+  } else {
+    /* initialize uniRunnerState for ring AllReduce */
+    FLAGCXCHECKGOTO(initUniRunnerStateRingAR(runnerState, sendbuff, recvbuff,
+                                             count, datatype, op, comm),
+                    res, out);
   }
-  size_t sliceCount = sliceBytes / esize;
-  if (sliceCount == 0)
-    sliceCount = 1;
-
-  void *tmpDev = nullptr;
-  FLAGCXCHECK(deviceAdaptor->deviceMalloc(&tmpDev, sliceCount * esize * nranks,
-                                          flagcxMemDevice, stream));
-  char *hostBuf = (char *)malloc(sliceCount * esize * nranks);
-  if (hostBuf == nullptr) {
-    FLAGCXCHECK(deviceAdaptor->deviceFree(tmpDev, flagcxMemDevice, stream));
-    return flagcxSystemError;
-  }
-
-  for (size_t off = 0; off < count; off += sliceCount) {
-    size_t n = (count - off) < sliceCount ? (count - off) : sliceCount;
-    // 1) gather this slice from all ranks into tmpDev (nranks sub-slices)
-    FLAGCXCHECK(uniRunnerAllGather(
-        (const char *)sendbuff + off * esize, tmpDev, n, datatype, comm,
-        stream));
-    // Kistich(device-reduce-sum): for Sum on fp32/fp16/bf16, reduce directly
-    // on device to avoid D2H + host reduce + H2D. tmpDev holds nranks
-    // sub-slices [rank0..rank{nranks-1}]; copy rank0 into recvbuff then
-    // accumulate the rest on device (aclnnInplaceAdd / CUDA kernel).
-    if (op == flagcxSum &&
-        (datatype == flagcxFloat32 || datatype == flagcxFloat16 ||
-         datatype == flagcxBfloat16)) {
-      // 关键同步：allgather 的 proxy H2D 在独立 cpStream 上，与主线程 commStream
-      // 跨流竞态；streamSynchronize(commStream) 不覆盖 cpStream，必须全设备同步
-      // 确保 tmpDev 的 H2D 完成后再 D2D/kernel 读，否则间歇读到旧数据（sum 错）。
-      FLAGCXCHECK(deviceAdaptor->deviceSynchronize());
-      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-          (char *)recvbuff + off * esize, tmpDev, n * esize,
-          flagcxMemcpyDeviceToDevice, stream, nullptr));
-      for (int r = 1; r < nranks; r++) {
-        FLAGCXCHECK(deviceAdaptor->reduceSum(
-            (char *)recvbuff + off * esize,
-            (const char *)tmpDev + r * n * esize, n, datatype, stream));
-      }
-      FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
-      continue;
-    }
-    // 2) D2H the gathered slice, then reduce on host
-    FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-        hostBuf, tmpDev, n * esize * nranks, flagcxMemcpyDeviceToHost, stream,
-        nullptr));
-    FLAGCXCHECK(deviceAdaptor->streamSynchronize(stream));
-    {
-      // Shadow count/bytes so the per-dtype reduce switch below (kept
-      // verbatim) operates on the current slice.
-      size_t count = n;
-      size_t bytes = n * esize;
-
-#define FLAGCX_HOST_REDUCE(T, OPNAME, EXPR)                                   \
-  do {                                                                        \
-    const T *src = (const T *)(hostBuf + bytes);                              \
-    T *dst = (T *)hostBuf;                                                    \
-    for (size_t i = 0; i < count; i++) {                                      \
-      T a = dst[i], b = src[i];                                               \
-      (void)a;                                                                \
-      (void)b;                                                                \
-      dst[i] = (EXPR);                                                        \
-    }                                                                         \
-  } while (0)
-
-  for (int r = 1; r < nranks; r++) {
-    char *slice = hostBuf + r * bytes;
-    switch (datatype) {
-    case flagcxFloat32: {
-      float *dst = (float *)hostBuf;
-      const float *src = (const float *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxProd) dst[i] *= src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxFloat64: {
-      double *dst = (double *)hostBuf;
-      const double *src = (const double *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxProd) dst[i] *= src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxBfloat16: {
-      uint16_t *dst = (uint16_t *)hostBuf;
-      const uint16_t *src = (const uint16_t *)slice;
-      auto bf2f = [](uint16_t v) -> float {
-        uint32_t u = ((uint32_t)(v & 0x8000)) << 16 |
-                     ((uint32_t)(v & 0x7fff)) << 16;
-        return *((float *)&u);
-      };
-      auto f2bf = [](float f) -> uint16_t {
-        uint32_t u = *((uint32_t *)&f);
-        uint32_t lsb = (u >> 16) & 1;
-        uint16_t r = (uint16_t)((u >> 16) + lsb);
-        return r;
-      };
-      for (size_t i = 0; i < count; i++) {
-        float a = bf2f(dst[i]), b = bf2f(src[i]);
-        float v;
-        if (op == flagcxSum) v = a + b;
-        else if (op == flagcxProd) v = a * b;
-        else if (op == flagcxMax) v = a > b ? a : b;
-        else if (op == flagcxMin) v = a < b ? a : b;
-        else v = a;
-        dst[i] = f2bf(v);
-      }
-      break;
-    }
-    case flagcxFloat16: {
-      uint16_t *dst = (uint16_t *)hostBuf;
-      const uint16_t *src = (const uint16_t *)slice;
-      auto h2f = [](uint16_t h) -> float {
-        uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, frac = h & 0x3ff;
-        uint32_t u;
-        if (exp == 0)
-          u = (sign << 31) | (frac << 13);
-        else if (exp == 31)
-          u = (sign << 31) | 0x7f800000 | (frac << 13);
-        else
-          u = (sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13);
-        return *((float *)&u);
-      };
-      auto f2h = [](float f) -> uint16_t {
-        uint32_t u = *((uint32_t *)&f);
-        uint32_t sign = (u >> 31) & 1, exp = (u >> 23) & 0xff, frac = u & 0x7fffff;
-        uint16_t h;
-        if (exp == 0xff)
-          h = (uint16_t)((sign << 15) | 0x7c00 | (frac ? 1 : 0));
-        else {
-          int32_t e = (int32_t)exp - 127 + 15;
-          if (e <= 0)
-            h = (uint16_t)(sign << 15);
-          else if (e >= 31)
-            h = (uint16_t)((sign << 15) | 0x7c00);
-          else
-            h = (uint16_t)((sign << 15) | (e << 10) | (frac >> 13));
-        }
-        return h;
-      };
-      for (size_t i = 0; i < count; i++) {
-        float a = h2f(dst[i]), b = h2f(src[i]);
-        float v;
-        if (op == flagcxSum) v = a + b;
-        else if (op == flagcxProd) v = a * b;
-        else if (op == flagcxMax) v = a > b ? a : b;
-        else if (op == flagcxMin) v = a < b ? a : b;
-        else v = a;
-        dst[i] = f2h(v);
-      }
-      break;
-    }
-    case flagcxInt64: {
-      int64_t *dst = (int64_t *)hostBuf;
-      const int64_t *src = (const int64_t *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxProd) dst[i] *= src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxUint64: {
-      uint64_t *dst = (uint64_t *)hostBuf;
-      const uint64_t *src = (const uint64_t *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxProd) dst[i] *= src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxInt32: {
-      int32_t *dst = (int32_t *)hostBuf;
-      const int32_t *src = (const int32_t *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxProd) dst[i] *= src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxUint32: {
-      uint32_t *dst = (uint32_t *)hostBuf;
-      const uint32_t *src = (const uint32_t *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxProd) dst[i] *= src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxInt8: {
-      int8_t *dst = (int8_t *)hostBuf;
-      const int8_t *src = (const int8_t *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    case flagcxUint8: {
-      uint8_t *dst = (uint8_t *)hostBuf;
-      const uint8_t *src = (const uint8_t *)slice;
-      for (size_t i = 0; i < count; i++) {
-        if (op == flagcxSum) dst[i] += src[i];
-        else if (op == flagcxMax) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
-        else if (op == flagcxMin) dst[i] = dst[i] < src[i] ? dst[i] : src[i];
-      }
-      break;
-    }
-    default:
-      free(hostBuf);
-      return flagcxInvalidArgument;
-    }
-  }
-#undef FLAGCX_HOST_REDUCE
-
-      // 3) H2D the reduced slice (bytes is the shadowed slice size)
-      FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-          (char *)recvbuff + off * esize, hostBuf, bytes,
-          flagcxMemcpyHostToDevice, stream, nullptr));
-    } // end slice scope (count/bytes shadow)
-  }   // end slice loop
-  free(hostBuf);
-  FLAGCXCHECK(deviceAdaptor->deviceFree(tmpDev, flagcxMemDevice, stream));
-  return flagcxSuccess;
+  FLAGCXCHECK(runUniRunner(comm));
+out:
+  FLAGCXCHECK(cleanupUniRunner(comm));
+  return res;
+#endif
 }
 
 flagcxResult_t uniRunnerReduceScatter(const void *sendbuff, void *recvbuff,

@@ -1867,11 +1867,28 @@ flagcxResult_t runUniRunner(flagcxComm_t comm) {
   flagcxUniRunnerState *runnerState = &hcomm->proxyState->uniRunnerState;
   TRACE(FLAGCX_UNIRUNNER, "runUniRunner called");
 
-#ifdef COMPILE_KERNEL_HOST
-  // Launch collective kernel
-  flagcxLaunchCollectiveKernel(
-      hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
-      runnerState->uniRunnerNBlocks, runnerState->redStream);
+#if defined(COMPILE_KERNEL_HOST) || defined(FLAGCX_USE_ASCEND_DAG)
+  // Launch persistent collective kernel (DAG FIFO consumer).
+  // CUDA: flagcxCollectiveKernel<<<>>>; Ascend: aclnnFlagcxCollective
+  // (both async on redStream; kernel persists and spins on the FIFO until
+  // terminate is set by the scheduling loop below).
+  // Platforms without an adaptor slot (launchCollectiveKernel == NULL) keep
+  // the legacy CUDA kernel launch — behavior unchanged.
+  if (deviceAdaptor->launchCollectiveKernel != NULL) {
+    FLAGCXCHECK(deviceAdaptor->launchCollectiveKernel(
+        hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
+        runnerState->uniRunnerNBlocks, runnerState->redStream));
+  } else {
+#if defined(COMPILE_KERNEL_HOST)
+    flagcxLaunchCollectiveKernel(
+        hcomm->uniRunnerFifoBuffer, runnerState->uniRunnerNThreads,
+        runnerState->uniRunnerNBlocks, runnerState->redStream);
+#else
+    // 昇腾 DAG：cannAdaptor 槽位恒实现，此处仅防御（避免引用 CUDA 符号）
+    WARN("launchCollectiveKernel not implemented by adaptor (Ascend DAG)");
+    return flagcxNotSupported;
+#endif
+  }
 #endif
 
   // Main scheduling loop using DAG-based queue scheduling
