@@ -245,6 +245,28 @@ struct flagcxDeviceAdaptor_latest {
   flagcxResult_t (*symMulticastFree)(void *mcHandle);
 
   flagcxResult_t (*getLastError)();
+
+  // Persistent collective kernel launch for the DAG engine (uniRunner).
+  // Launches the FIFO consumer that spins on the FIFO until terminate is set.
+  // CUDA: flagcxCollectiveKernel<<<>>> (async); Ascend: aclnnFlagcxCollective
+  // (async, kernel persists). NULL if the platform has no persistent-kernel
+  // path — callers then keep the legacy CUDA launch (behavior unchanged).
+  // Added after getLastError so positional initializers in existing adaptors
+  // leave it zero-initialized (NULL) without source changes.
+  flagcxResult_t (*launchCollectiveKernel)(void *fifoBuffer, size_t nthreads,
+                                           size_t nblocks, void *stream);
+
+  // Device-side reduce (Sum) for heterogeneous allreduce: dst += src on
+  // device, avoiding D2H + host reduce + H2D. CANN: aclnnInplaceAdd;
+  // NVIDIA: CUDA kernel in adaptor/kernel/nvidia/flagcx_device_reduce.cu.
+  //
+  // ⚠️ NOTE: fields must be APPENDED AT THE TAIL, never inserted mid-struct.
+  // flagcxDeviceAdaptorUpgradeV1() upgrades a v1 plugin; inserting a field in
+  // the middle shifts every later field of that plugin, and the loader's
+  // name-based validation (device_plugin_load.cc) cannot detect the shift
+  // because the shifted slots still hold non-NULL pointers.
+  flagcxResult_t (*reduceSum)(void *dst, const void *src, size_t count,
+                              flagcxDataType_t datatype, flagcxStream_t stream);
 };
 
 #define flagcxDeviceAdaptor flagcxDeviceAdaptor_latest
@@ -254,8 +276,82 @@ struct flagcxDeviceAdaptor_latest {
 static inline void
 flagcxDeviceAdaptorUpgradeV1(const struct flagcxDeviceAdaptor_v1 *src,
                              struct flagcxDeviceAdaptor_latest *dst) {
+  // Field-by-field copy, deliberately NOT a byte-wise memcpy.
+  //
+  // memcpy(dst, src, sizeof(*src)) is only correct while the two structs share
+  // an identical prefix. As soon as a field is inserted anywhere before the
+  // tail of the v1 region, every later v1 field lands one slot off, and
+  // device_plugin_load.cc's name-based validation cannot detect it -- the
+  // shifted slots hold non-NULL pointers that belong to other fields.
+  // Assigning by name makes the upgrade immune to layout drift: a renamed or
+  // removed field becomes a compile error, and an added field simply stays
+  // NULL (safe default).
+  //
+  // MAINTENANCE: when adding a field to flagcxDeviceAdaptor_v1, add the
+  // corresponding assignment here as well.
   memset(dst, 0, sizeof(*dst));
-  memcpy(dst, src, sizeof(struct flagcxDeviceAdaptor_v1));
+  memcpy(dst->name, src->name, sizeof(dst->name));
+
+  // Basic functions
+  dst->deviceSynchronize = src->deviceSynchronize;
+  dst->deviceMemcpy = src->deviceMemcpy;
+  dst->deviceMemset = src->deviceMemset;
+  dst->deviceMalloc = src->deviceMalloc;
+  dst->deviceFree = src->deviceFree;
+  dst->setDevice = src->setDevice;
+  dst->getDevice = src->getDevice;
+  dst->getDeviceCount = src->getDeviceCount;
+  dst->getVendor = src->getVendor;
+  dst->hostGetDevicePointer = src->hostGetDevicePointer;
+  // GDR functions
+  dst->memHandleInit = src->memHandleInit;
+  dst->memHandleDestroy = src->memHandleDestroy;
+  dst->gdrMemAlloc = src->gdrMemAlloc;
+  dst->gdrMemFree = src->gdrMemFree;
+  dst->hostShareMemAlloc = src->hostShareMemAlloc;
+  dst->hostShareMemFree = src->hostShareMemFree;
+  dst->gdrPtrMmap = src->gdrPtrMmap;
+  dst->gdrPtrMunmap = src->gdrPtrMunmap;
+  // Stream functions
+  dst->streamCreate = src->streamCreate;
+  dst->streamDestroy = src->streamDestroy;
+  dst->streamCopy = src->streamCopy;
+  dst->streamFree = src->streamFree;
+  dst->streamSynchronize = src->streamSynchronize;
+  dst->streamQuery = src->streamQuery;
+  dst->streamWaitEvent = src->streamWaitEvent;
+  dst->streamWaitValue64 = src->streamWaitValue64;
+  dst->streamWriteValue64 = src->streamWriteValue64;
+  // Event functions
+  dst->eventCreate = src->eventCreate;
+  dst->eventDestroy = src->eventDestroy;
+  dst->eventRecord = src->eventRecord;
+  dst->eventSynchronize = src->eventSynchronize;
+  dst->eventQuery = src->eventQuery;
+  dst->eventElapsedTime = src->eventElapsedTime;
+  // IpcMemHandle functions
+  dst->ipcMemHandleCreate = src->ipcMemHandleCreate;
+  dst->ipcMemHandleGet = src->ipcMemHandleGet;
+  dst->ipcMemHandleOpen = src->ipcMemHandleOpen;
+  dst->ipcMemHandleClose = src->ipcMemHandleClose;
+  dst->ipcMemHandleFree = src->ipcMemHandleFree;
+  // Kernel launch
+  dst->launchKernel = src->launchKernel;
+  dst->copyArgsInit = src->copyArgsInit;
+  dst->copyArgsFree = src->copyArgsFree;
+  dst->launchDeviceFunc = src->launchDeviceFunc;
+  // Others
+  dst->getDeviceProperties = src->getDeviceProperties;
+  dst->getDevicePciBusId = src->getDevicePciBusId;
+  dst->getDeviceByPciBusId = src->getDeviceByPciBusId;
+  // HostFunc launch
+  dst->launchHostFunc = src->launchHostFunc;
+  // DMA buffer
+  dst->dmaSupport = src->dmaSupport;
+  dst->getHandleForAddressRange = src->getHandleForAddressRange;
+  // Everything added beyond v1 (hostRegister/hostUnregister, sym* VMM,
+  // getLastError, launchCollectiveKernel, reduceSum) stays NULL from the
+  // memset above, exactly as before.
 }
 
 // Device adaptor plugin API version (independent of CCL/Net versions)

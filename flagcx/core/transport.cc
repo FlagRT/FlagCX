@@ -78,7 +78,11 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           }
           resources->buffSizes[0] = flagcxNetBufferSize;
           if (comm->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-            resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
+            // Kistich(fix-hetero-deadlock): pinned host mem so cudaMemcpyAsync
+            // D2H is truly async (pageable malloc would block proxy thread).
+            FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+                (void **)&resources->buffers[0], resources->buffSizes[0],
+                flagcxMemHost, NULL));
             if (!resources->buffers[0]) {
               return flagcxSystemError;
             }
@@ -162,7 +166,11 @@ flagcxResult_t flagcxTransportP2pSetup(struct flagcxHeteroComm *comm,
           }
           resources->buffSizes[0] = flagcxNetBufferSize;
           if (comm->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-            resources->buffers[0] = (char *)malloc(resources->buffSizes[0]);
+            // Kistich(fix-hetero-deadlock): pinned host mem so cudaMemcpyAsync
+            // D2H is truly async (pageable malloc would block proxy thread).
+            FLAGCXCHECK(deviceAdaptor->deviceMalloc(
+                (void **)&resources->buffers[0], resources->buffSizes[0],
+                flagcxMemHost, NULL));
             if (!resources->buffers[0]) {
               return flagcxSystemError;
             }

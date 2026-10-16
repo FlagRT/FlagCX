@@ -1,0 +1,7 @@
+[
+  {"op": "FlagcxCollective",
+   "input_desc": [
+     {"name": "fifo", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+   ],
+   "output_desc": []}
+]

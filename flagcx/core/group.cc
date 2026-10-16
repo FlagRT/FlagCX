@@ -456,6 +456,16 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     } else {
       FLAGCXCHECK(deviceAdaptor->launchHostFunc(launchStream, cpuAsyncKernel,
                                                 (void *)semaphore.get()));
+      // Kistich(fix-hetero-deadlock): the host func only signals the proxy
+      // to start; the main thread enforces completion here. Waiting inside
+      // the host func deadlocks the driver against the proxy thread.
+      semaphore->wait();
+      if (semaphore->hasError()) {
+        WARN("flagcxGroupLaunch: proxy reported error (semaphore error flag) "
+             "-- aborting");
+        ret = flagcxInternalError;
+        goto fail;
+      }
     }
   }
 
@@ -485,10 +495,17 @@ static flagcxResult_t groupCleanup(struct flagcxAsyncJob *job_) {
       *asyncJobsMain = gjob->asyncJobsPtr;
 
   // clean up preconnect comms
-  while (groupCommPreconnectHeadMain != nullptr) {
+  // Kistich: guard against re-entry / poisoned nodes (preconnectNext == 0x1)
+  while (groupCommPreconnectHeadMain != nullptr &&
+         groupCommPreconnectHeadMain !=
+             reinterpret_cast<struct flagcxHeteroComm *>(0x1)) {
     struct flagcxHeteroComm *comm = groupCommPreconnectHeadMain;
     struct flagcxHeteroComm *next = comm->preconnectNext;
     comm->preconnectNext = reinterpret_cast<struct flagcxHeteroComm *>(0x1);
+    if (next == reinterpret_cast<struct flagcxHeteroComm *>(0x1) ||
+        next == comm) {
+      break; // poisoned or cyclic: stop walking
+    }
     groupCommPreconnectHeadMain = next;
   }
 

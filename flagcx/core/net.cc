@@ -166,11 +166,6 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
               args->subs[step].stepBuff, (char *)data + args->totalCopySize,
               args->subs[step].stepSize, flagcxMemcpyDeviceToDevice,
               resources->cpStream, args->subs[step].copyArgs));
-        } else if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-          FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
-              args->subs[step].stepBuff, (char *)data + args->totalCopySize,
-              args->subs[step].stepSize, flagcxMemcpyDeviceToHost,
-              resources->cpStream, args->subs[step].copyArgs));
         } else {
           FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
               args->subs[step].stepBuff, (char *)data + args->totalCopySize,
@@ -194,7 +189,11 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
       int step = args->posted & stepMask;
       int done = 0;
       if (!args->regBufFlag) {
-        if (deviceAdaptor->eventQuery(resources->cpEvents[step]) ==
+        // Kistich(fix-stale-data): per-chunk eventSynchronize. streamQuery on
+        // CANN can report COMPLETE before the D2H data is CPU-visible
+        // (aarch64 DMA/cache window), so isend would transmit a stale buffer.
+        // Blocking on the chunk event guarantees the copy has executed.
+        if (deviceAdaptor->eventSynchronize(resources->cpEvents[step]) ==
             flagcxSuccess) {
           args->copied++;
           done = 1;
@@ -219,7 +218,7 @@ flagcxResult_t flagcxProxySend(sendNetResources *resources, void *data,
     if (args->transmitted < args->posted) {
       void *req = args->subs[args->transmitted & stepMask].requests[0];
       int done = 0, sizes;
-      resources->netAdaptor->test(req, &done, &sizes);
+      FLAGCXCHECK(resources->netAdaptor->test(req, &done, &sizes));
       if (done) {
         args->transmitted++;
       }
@@ -273,7 +272,7 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
     if (args->postFlush < args->posted) {
       void *req = args->subs[args->postFlush & stepMask].requests[0];
       int done = 0, sizes;
-      resources->netAdaptor->test(req, &done, &sizes);
+      FLAGCXCHECK(resources->netAdaptor->test(req, &done, &sizes));
       if (done) {
         if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
           void *req = NULL;
@@ -317,7 +316,7 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
         done = 1;
         sizes = 0;
       } else {
-        resources->netAdaptor->test(req, &done, &sizes);
+        FLAGCXCHECK(resources->netAdaptor->test(req, &done, &sizes));
       }
       if (done) {
         if (!args->regBufFlag) {
@@ -352,7 +351,10 @@ flagcxResult_t flagcxProxyRecv(recvNetResources *resources, void *data,
     if (args->copied < args->waitCopy) {
       int step = args->copied & stepMask;
       if (!args->regBufFlag) {
-        if (deviceAdaptor->eventQuery(resources->cpEvents[step]) ==
+        // Kistich(fix-stale-data): stream-based completion — guarantees
+        // H2D has fully executed before subCounter lets wait() return,
+        // so the user never observes a stale tensor.
+        if (deviceAdaptor->eventSynchronize(resources->cpEvents[step]) ==
             flagcxSuccess) {
           args->copied++;
         }
@@ -378,7 +380,8 @@ flagcxResult_t flagcxSendProxyFree(sendNetResources *resources) {
                                  resources->mhandles[0]);
   resources->netAdaptor->closeSend(resources->netSendComm);
   if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-    free(resources->buffers[0]);
+    FLAGCXCHECK(deviceAdaptor->deviceFree(resources->buffers[0],
+                                          flagcxMemHost, NULL));
   } else if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
     FLAGCXCHECK(deviceAdaptor->gdrMemFree(resources->buffers[0], NULL));
   } else {
@@ -401,7 +404,8 @@ flagcxResult_t flagcxRecvProxyFree(recvNetResources *resources) {
   resources->netAdaptor->closeRecv(resources->netRecvComm);
   resources->netAdaptor->closeListen(resources->netListenComm);
   if (resources->netAdaptor == getUnifiedNetAdaptor(SOCKET)) {
-    free(resources->buffers[0]);
+    FLAGCXCHECK(deviceAdaptor->deviceFree(resources->buffers[0],
+                                          flagcxMemHost, NULL));
   } else if (resources->netAdaptor == getUnifiedNetAdaptor(IBRC)) {
     FLAGCXCHECK(deviceAdaptor->gdrMemFree(resources->buffers[0], NULL));
   } else {

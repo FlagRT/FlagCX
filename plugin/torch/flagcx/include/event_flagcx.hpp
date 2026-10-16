@@ -59,6 +59,9 @@ public:
 
   virtual void block(const int deviceId) = 0;
   virtual void block(const flagcxStream_t &stream, const int deviceId) = 0;
+  // Host-blocking wait for the event (default: no-op, non-CANN adaptors keep
+  // their existing semantics). CANN implements it as aclrtSynchronizeEvent.
+  virtual void synchronize() {}
 };
 
 #ifdef USE_NVIDIA_ADAPTOR
@@ -142,6 +145,15 @@ inline aclrtStream GetFlagcxCurrentAclStream(int device_id) {
 class flagcxCannEvent : public flagcxEvent {
 public:
   flagcxCannEvent() { aclrtCreateEvent(&npu_event); }
+  // RAII: destroy the ACL event. Without this, every collective leaks one
+  // aclrtEvent (DDP: ~bucket-count events per step) and the resource pool
+  // exhausts after a few hundred steps (observed ~765 for Qwen2.5-1.5B),
+  // making aclrtCreateEvent slow and corrupting sync state.
+  ~flagcxCannEvent() override {
+    if (npu_event != nullptr) {
+      aclrtDestroyEvent(npu_event);
+    }
+  }
 
   void record(const int device_id) override {
     aclrtRecordEvent(npu_event, GetFlagcxCurrentAclStream(device_id));
@@ -160,6 +172,8 @@ public:
     (void)device_id;
     aclrtStreamWaitEvent(*(aclrtStream *)stream, npu_event);
   }
+
+  void synchronize() override { aclrtSynchronizeEvent(npu_event); }
 
 private:
   aclrtEvent npu_event;

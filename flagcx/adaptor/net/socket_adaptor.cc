@@ -155,10 +155,17 @@ struct flagcxNetSocketTask {
   flagcxResult_t result;
 };
 
+// O4: 握手 header（替代原 4 字节 size，附 op 序号以校验配对）
+struct flagcxSocketHdr {
+  int seq;
+  int size;
+};
+
 struct flagcxNetSocketRequest {
   int op;
   void *data;
   int size;
+  int seq; // O4: per-comm 单调递增 op 身份（发送侧分配，接收侧校验）
   struct flagcxSocket *ctrlSock;
   int offset;
   int used;
@@ -197,6 +204,8 @@ struct flagcxNetSocketComm {
   int nSocks;
   int nThreads;
   int nextSock;
+  int sendSeq; // O4: 发送侧已分配序号（递增）
+  int recvSeq; // O4: 接收侧期望序号（校验通过后 +1）
   struct flagcxNetSocketRequest requests[MAX_REQUESTS];
   pthread_t helperThread[MAX_THREADS];
   struct flagcxNetSocketThreadResources threadResources[MAX_THREADS];
@@ -511,36 +520,49 @@ flagcxResult_t flagcxNetSocketGetTask(struct flagcxNetSocketComm *comm, int op,
 flagcxResult_t flagcxNetSocketTest(void *request, int *done, int *size) {
   *done = 0;
   struct flagcxNetSocketRequest *r = (struct flagcxNetSocketRequest *)request;
+  if (r->used == 3) /* O4: 协议错位终态——不再触碰 socket */
+    return flagcxInternalError;
   if (r == NULL) {
     WARN("NET/Socket : test called with NULL request");
     return flagcxInternalError;
   }
-  if (r->used == 1) { /* try to send/recv size */
-    int data = r->size;
+  if (r->used == 1) { /* try to send/recv {seq,size} header */
+    struct flagcxSocketHdr hdr = {r->seq, r->size};
     int offset = 0;
     FLAGCXCHECK(
-        flagcxSocketProgress(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+        flagcxSocketProgress(r->op, r->ctrlSock, &hdr, sizeof(hdr), &offset));
 
     if (offset == 0)
       return flagcxSuccess; /* Not ready -- retry later */
 
-    // Not sure we could ever receive less than 4 bytes, but just in case ...
-    if (offset < sizeof(int))
+    // Not sure we could ever receive less than 8 bytes, but just in case ...
+    if (offset < (int)sizeof(hdr))
       FLAGCXCHECK(
-          flagcxSocketWait(r->op, r->ctrlSock, &data, sizeof(int), &offset));
+          flagcxSocketWait(r->op, r->ctrlSock, &hdr, sizeof(hdr), &offset));
 
-    // Check size is less or equal to the size provided by the user
-    if (r->op == FLAGCX_SOCKET_RECV && data > r->size) {
-      char line[SOCKET_NAME_MAXLEN + 1];
-      union flagcxSocketAddress addr;
-      flagcxSocketGetAddr(r->ctrlSock, &addr);
-      WARN(
-          "NET/Socket : peer %s message truncated : receiving %d bytes instead of %d. If you believe your socket network is in healthy state, \
-          there may be a mismatch in collective sizes or environment settings (e.g. FLAGCX_PROTO, FLAGCX_ALGO) between ranks",
-          flagcxSocketToString(&addr, line), data, r->size);
-      return flagcxInvalidUsage;
+    if (r->op == FLAGCX_SOCKET_RECV) {
+      // O4: seq + size 双向校验——配对错位立即暴露，绝不静默。
+      // 历史：原实现仅 data > r->size 报错，data < r->size 静默接受导致
+      // 跨 op 数据错位不可检测（E1）。
+      if (hdr.seq != r->seq || hdr.size != r->size) {
+        char line[SOCKET_NAME_MAXLEN + 1];
+        union flagcxSocketAddress addr;
+        flagcxSocketGetAddr(r->ctrlSock, &addr);
+        WARN(
+            "NET/Socket : op mismatch on recv (peer %s): got seq=%d size=%d, expect seq=%d size=%d. \
+            Op ordering between ranks is broken — aborting instead of corrupting data.",
+            flagcxSocketToString(&addr, line), hdr.seq, hdr.size, r->seq,
+            r->size);
+        r->used = 3; // O4: 协议错位终态——停止触碰 socket，错误持续上报
+        return flagcxInternalError;
+      }
+      // O4 修复（seq 错位竞态）：recvSeq 递增从"test 校验通过后"前移到
+      // "irecv 提交时"，与 send 侧 sendSeq++（isend 提交时）对称。否则
+      // flagcxProxyRecv 一次提交多个 chunk 时（posted-copied<flagcxNetChunks），
+      // 连续 irecv 读同一个 recvSeq，期望 seq 全重复，send 侧 seq 0,1,2... 匹配
+      // 不上 → 大 tensor（多 chunk）首 chunk 后即 op mismatch。
     }
-    r->size = data;
+    r->size = hdr.size;
     r->offset = 0;
     r->used = 2; // done exchanging size
     // divide into subtasks
@@ -611,6 +633,8 @@ flagcxResult_t flagcxNetSocketIsend(void *sendComm, void *data, size_t size,
   FLAGCXCHECK(
       flagcxNetSocketGetRequest(comm, FLAGCX_SOCKET_SEND, data, size,
                                 (struct flagcxNetSocketRequest **)request));
+  // O4: 分配 per-comm 递增 seq（op 身份）
+  (*(struct flagcxNetSocketRequest **)request)->seq = comm->sendSeq++;
   return flagcxSuccess;
 }
 
@@ -623,6 +647,8 @@ flagcxResult_t flagcxNetSocketIrecv(void *recvComm, int n, void **data,
   FLAGCXCHECK(
       flagcxNetSocketGetRequest(comm, FLAGCX_SOCKET_RECV, data[0], sizes[0],
                                 (struct flagcxNetSocketRequest **)request));
+  // O4 修复：提交 irecv 时即分配并递增期望 seq（对称 send 侧 sendSeq++）。
+  (*(struct flagcxNetSocketRequest **)request)->seq = comm->recvSeq++;
   return flagcxSuccess;
 }
 

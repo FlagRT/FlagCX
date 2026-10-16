@@ -323,7 +323,14 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
             if (op->connection->transport == TRANSPORT_NET) {
               struct sendNetResources *resources =
                   (sendNetResources *)op->connection->transportResources;
-              flagcxProxySend(resources, op->recvbuff, op->nbytes, &op->args);
+              flagcxResult_t sres =
+                  flagcxProxySend(resources, op->recvbuff, op->nbytes,
+                                  &op->args);
+              if (sres != flagcxSuccess) {
+                WARN("flagcxProxySend failed: %d (opId=%d) -- flagging error",
+                     sres, op->args.opId);
+                op->args.semaphore->setError();
+              }
               if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
@@ -353,7 +360,14 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
             if (op->connection->transport == TRANSPORT_NET) {
               struct recvNetResources *resources =
                   (recvNetResources *)op->connection->transportResources;
-              flagcxProxyRecv(resources, op->recvbuff, op->nbytes, &op->args);
+              flagcxResult_t rres =
+                  flagcxProxyRecv(resources, op->recvbuff, op->nbytes,
+                                  &op->args);
+              if (rres != flagcxSuccess) {
+                WARN("flagcxProxyRecv failed: %d (opId=%d) -- flagging error",
+                     rres, op->args.opId);
+                op->args.semaphore->setError();
+              }
               if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
                 // update refcount and delete semaphore when refcount = 0
                 op->args.semaphore.reset();

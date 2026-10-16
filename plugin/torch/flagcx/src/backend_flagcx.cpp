@@ -4,6 +4,15 @@
  * Copyright (c) 2025 by DU. All Rights Reserved.
  ************************************************************************/
 #include "backend_flagcx.hpp"
+#ifdef USE_NVIDIA_ADAPTOR
+// 只有 NVIDIA 线需要（使用点见 getStreamByIndex 的
+// at::cuda::getCurrentCUDAStream）。**不得无条件包含**：纯昇腾栈
+// （torch 2.10.0+cpu + torch_npu）里没有 cuda_runtime_api.h，
+// 无条件包含会让 `USE_ASCEND=1 pip install .` 在编译期直接失败。
+#include <ATen/cuda/CUDAContext.h>
+#endif
+#include <dlfcn.h>
+#include <c10/core/DeviceGuard.h>
 #include "utils_flagcx.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -266,7 +275,15 @@ bool flagcxWork::isCompleted() { return future_->completed(); }
 bool flagcxWork::isSuccess() const { return future_->hasValue(); }
 
 bool flagcxWork::wait(std::chrono::milliseconds /* unused */) {
-  event_->block(deviceId_);
+  // Block on the COLLECTIVE stream (stream_ = getStreamByIndex(0)), not the
+  // device-wide fallback: aclrtStreamWaitEvent inserts the wait into that
+  // stream, and subsequent tensor ops on the same (torch_npu current) stream
+  // are then ordered after the collective. Using block(deviceId_) here goes
+  // through GetFlagcxCurrentAclStream() which, without torch_fl exporting
+  // GetCurrentStream, falls back to a self-managed stream -- the wait lands
+  // on a stream no computation uses, so DDP gradients race the allreduce
+  // (observed: Qwen2.5-1.5B DDP degrades from step ~765).
+  event_->block(stream_, deviceId_);
   if (isBarrierOp_) {
     C10D_FLAGCX_CHECK(devHandle_->streamSynchronize(stream_), std::nullopt);
   }
@@ -332,6 +349,57 @@ flagcxBackend::~flagcxBackend() {
 }
 
 flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
+#ifdef USE_NVIDIA_ADAPTOR
+  if (streamId == 0) {
+    // 4090 line: run collectives on the CURRENT CUDA stream (PyTorch
+    // semantics) so results are visible to subsequent tensor ops on the
+    // same stream. A self-managed cached stream breaks happens-before:
+    // NCCL submits on one stream while tensor reads synchronize another
+    // -> stale/zero data (same root cause fixed on the ascend line).
+    static thread_local cudaStream_t curCudaStream = nullptr;
+    curCudaStream = at::cuda::getCurrentCUDAStream(deviceId_).stream();
+    return reinterpret_cast<flagcxStream_t>(&curCudaStream);
+  }
+#endif
+#ifdef USE_ASCEND_ADAPTOR
+  // A-line (torch_npu): run collectives on torch_npu's CURRENT stream so
+  // results are visible to subsequent tensor ops on the same stream.
+  // We must NOT link libtorch_npu.so (decoupled build); instead:
+  //   1) dlopen(RTLD_NOLOAD) grabs the already-loaded handle (null if
+  //      torch_npu is absent -> fall through to the torch_fl/self-managed
+  //      fallback below, keeping B-line compatibility);
+  //   2) c10 guardImpl (PrivateUse1) resolves the current c10::Stream;
+  //   3) dlsym'ed c10_npu::NPUStream::stream() converts it to aclrtStream
+  //      (NPUStream's memory starts with its c10::Stream member, so a
+  //      pointer to the c10::Stream doubles as the NPUStream* this).
+  if (streamId == 0) {
+    static void *torchNpuHandle = []() -> void * {
+      return dlopen("libtorch_npu.so", RTLD_LAZY | RTLD_NOLOAD);
+    }();
+    if (torchNpuHandle != nullptr) {
+      using NpuStreamFn = void *(*)(const void *);
+      static NpuStreamFn npuStreamFn = reinterpret_cast<NpuStreamFn>(
+          dlsym(torchNpuHandle, "_ZNK7c10_npu9NPUStream6streamEv"));
+      if (npuStreamFn != nullptr) {
+        try {
+          auto *guardImpl =
+              c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1);
+          c10::Stream cur = guardImpl->getStream(
+              c10::Device(c10::DeviceType::PrivateUse1, deviceId_));
+          static thread_local void *curAclStream = nullptr;
+          curAclStream = npuStreamFn(&cur);
+          // NOTE: NPUStream::stream() returns nullptr for the DEFAULT
+          // stream (ACL semantics: null == default stream). nullptr is a
+          // VALID stream here -- using it keeps collectives ordered with
+          // tensor ops on the default stream.
+          return reinterpret_cast<flagcxStream_t>(&curAclStream);
+        } catch (...) {
+          // PrivateUse1 guard not registered yet; fall back below.
+        }
+      }
+    }
+  }
+#endif
   if (auto search = flagcxStreams_.find(streamId);
       search != flagcxStreams_.end()) {
     return search->second;
@@ -423,6 +491,10 @@ void flagcxBackend::initComm(at::Device dev) {
         throw std::runtime_error(
             "flagcx communicator was initialized with different device");
       }
+      // Kistich: HCCL collectives require the current ACL device to match the
+      // communicator's device. torch_fl operations (model load, allocator)
+      // may switch the current device away; re-assert it on every collective.
+      C10D_FLAGCX_CHECK(devHandle_->setDevice(deviceId_), std::nullopt);
     }
   }
 }
@@ -561,15 +633,17 @@ c10::intrusive_ptr<Work> flagcxBackend::endCoalescing() {
     work->isBarrierOp_ = false;
     work->future_ = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
+    work->event_->synchronize();
     work->future_->markCompleted(c10::IValue(0));
     return work;
   }
 
   groupEnd();
 
-  auto work = c10::make_intrusive<flagcxWork>(OpType::COALESCED,
-                                              getStreamByIndex(0), devHandle_);
-  work->event_->record(getStreamByIndex(0), deviceId_);
+  auto stream = getStreamByIndex(0);
+  auto work = c10::make_intrusive<flagcxWork>(OpType::COALESCED, stream,
+                                              devHandle_);
+  work->event_->record(stream, deviceId_);
   work->deviceId_ = deviceId_;
   // Currently, hetero coalesced ops require a barrier op to avoid hanging issue
   // TODO: remove this barrier op when the hanging issue is resolved
@@ -579,6 +653,7 @@ c10::intrusive_ptr<Work> flagcxBackend::endCoalescing() {
   // Create a future to track the coalesced operation
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()));
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(0));
 
   return work;
@@ -602,8 +677,9 @@ flagcxBackend::collectiveCoalesced(std::vector<at::Tensor> &inputs,
 
   // First let default flagcx stream wait for input tensor allocation stream
   syncStream(device);
+  flagcxStream_t stream = getStreamByIndex(0);
   auto work =
-      c10::make_intrusive<flagcxWork>(opType, getStreamByIndex(0), devHandle_);
+      c10::make_intrusive<flagcxWork>(opType, stream, devHandle_);
 
   {
     int isHomo;
@@ -615,7 +691,6 @@ flagcxBackend::collectiveCoalesced(std::vector<at::Tensor> &inputs,
     // more tests are required to confirm,
     // so we disable multi-stream support for now
     // flagcxStream_t stream;
-    flagcxStream_t stream = getStreamByIndex(0);
 
     for (const auto i : c10::irange(inputs.size())) {
       // if (isHomo) {
@@ -644,13 +719,14 @@ flagcxBackend::collectiveCoalesced(std::vector<at::Tensor> &inputs,
     // }
   }
 
-  work->event_->record(getStreamByIndex(0), deviceId_);
+  work->event_->record(stream, deviceId_);
   work->deviceId_ = deviceId_;
   work->isBarrierOp_ = false;
   // Create a future to track the coalesced operation
   std::vector<at::Device> devices{inputs[0].device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputs[0]));
   return work;
 }
@@ -715,6 +791,7 @@ flagcxBackend::allgather(std::vector<std::vector<at::Tensor>> &outputTensors,
   std::vector<at::Device> devices{inputTensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensorsTmp));
   return work;
 }
@@ -752,6 +829,7 @@ flagcxBackend::_allgather_base(at::Tensor &outputTensor,
   std::vector<at::Device> devices{inputTensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensor));
   return work;
 }
@@ -815,6 +893,7 @@ flagcxBackend::allreduce(std::vector<at::Tensor> &tensors,
   std::vector<at::Device> devices{tensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(tensors));
   return work;
 }
@@ -921,6 +1000,7 @@ flagcxBackend::alltoall(std::vector<at::Tensor> &outputTensors,
   std::vector<at::Device> devices{device};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensors));
   return work;
 }
@@ -990,6 +1070,7 @@ flagcxBackend::alltoall_base(at::Tensor &outputTensor, at::Tensor &inputTensor,
   std::vector<at::Device> devices{device};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensor));
   return work;
 }
@@ -1008,6 +1089,7 @@ c10::intrusive_ptr<Work> flagcxBackend::barrier(const BarrierOptions &opts) {
   // Create a future to track the barrier operation
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()));
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(0));
   return work;
 }
@@ -1042,6 +1124,7 @@ flagcxBackend::broadcast(std::vector<at::Tensor> &tensors,
   std::vector<at::Device> devices{tensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(tensors));
   return work;
 }
@@ -1099,6 +1182,7 @@ flagcxBackend::gather(std::vector<std::vector<at::Tensor>> &outputTensors,
   std::vector<at::Device> devices{inputTensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensorsTmp));
   return work;
 }
@@ -1136,6 +1220,7 @@ c10::intrusive_ptr<Work> flagcxBackend::reduce(std::vector<at::Tensor> &tensors,
   std::vector<at::Device> devices{tensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(tensors));
   return work;
 }
@@ -1195,6 +1280,7 @@ c10::intrusive_ptr<Work> flagcxBackend::reduce_scatter(
   std::vector<at::Device> devices{outputTensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensor));
   return work;
 }
@@ -1239,6 +1325,7 @@ flagcxBackend::_reduce_scatter_base(at::Tensor &outputTensor,
   std::vector<at::Device> devices{outputTensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensor));
   return work;
 }
@@ -1328,6 +1415,7 @@ flagcxBackend::scatter(std::vector<at::Tensor> &outputTensors,
   std::vector<at::Device> devices{outputTensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(outputTensor));
   return work;
 }
@@ -1380,6 +1468,7 @@ c10::intrusive_ptr<Work> flagcxBackend::send(std::vector<at::Tensor> &tensors,
   std::vector<at::Device> devices{tensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(tensors));
   return work;
 }
@@ -1432,6 +1521,7 @@ c10::intrusive_ptr<Work> flagcxBackend::recv(std::vector<at::Tensor> &tensors,
   std::vector<at::Device> devices{tensor.device()};
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()), devices);
+  work->event_->synchronize();
   work->future_->markCompleted(c10::IValue(tensors));
   return work;
 }

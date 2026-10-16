@@ -1,5 +1,6 @@
 #include "flagcx.h"
 #include "adaptor.h"
+#include "flagcx_errors.h"
 #include "adaptor_plugin_load.h"
 #include "alloc.h"
 #include "bootstrap.h"
@@ -1583,19 +1584,45 @@ flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t uniqueId) {
 }
 
 const char *flagcxGetErrorString(flagcxResult_t result) {
-  // TODO: implement a method to retrieve error string
-  return "Not implemented.";
+  switch (result) {
+  case flagcxSuccess:
+    return "Success";
+  case flagcxUnhandledDeviceError:
+    return "Unhandled device error (see flagcxGetLastError)";
+  case flagcxSystemError:
+    return "System error (errno)";
+  case flagcxInternalError:
+    return "Internal error";
+  case flagcxInvalidArgument:
+    return "Invalid argument";
+  case flagcxInvalidUsage:
+    return "Invalid usage";
+  case flagcxRemoteError:
+    return "Remote error";
+  case flagcxInProgress:
+    return "In progress";
+  case flagcxUnhandledCCLError:
+    return "Unhandled CCL error";
+  case flagcxNotSupported:
+    return "Not supported";
+  default:
+    return "Unknown flagcx error";
+  }
 }
 
 const char *flagcxGetLastError(flagcxComm_t comm) {
-  // TODO: implement a method to retrieve last error string
+  // 优先返回线程局部最近一次错误（含文件:行/厂商错误码），由 DEVCHECK /
+  // FLAGCXCHECK 在失败时写入（flagcx_errors.h）。
+  if (flagcx::tlsErrorSet) {
+    return flagcx::tlsLastError.msg;
+  }
   if (comm == NULL) {
-    return "Undefined: flagcxComm is not fully initialized.";
+    return "flagcx: no error recorded (comm is not initialized)";
   }
   if (useHomoComm(comm)) {
     return cclAdaptors[flagcxCCLAdaptorDevice]->getLastError(comm->homoComm);
   }
-  return "Not implemented.";
+  return "flagcx: no error recorded";
 }
 
 // ---- Custom op DevComm state init/destroy ----
@@ -1897,8 +1924,19 @@ flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
 
   memcpy((void *)commId, (void *)&uniqueIdData[comm->homoRootRank],
          sizeof(flagcxUniqueId));
+  // Pass the bootstrap state so the ccl adaptor can exchange
+  // vendor-specific root info (e.g. 4108B HcclRootInfo) that does not
+  // fit inside the 256B flagcxUniqueId.
+  // 同时把「本簇的全局 rank 列表」交给适配器：适配器内部的 bootstrap 集合操作
+  // 必须用全局 rank 做 peer/tag（nranks/rank 参数是簇内序，两者不能混用）。
+  if (state != NULL) {
+    state->clusterGlobalRanks = comm->homoRanksGlobalList.empty()
+                                    ? NULL
+                                    : comm->homoRanksGlobalList.data();
+    state->clusterNranks = (int)comm->homoRanksGlobalList.size();
+  }
   FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
-      homoComm, comm->homoRanks, commId, comm->homoRank, NULL));
+      homoComm, comm->homoRanks, commId, comm->homoRank, state));
   return flagcxSuccess;
 }
 
@@ -2027,6 +2065,20 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   (*comm)->homoRank = globalRankToHomoRankData[rank];
   (*comm)->clusterIds = clusterIdData;
   (*comm)->globalRank2HomoRank = globalRankToHomoRankData;
+
+  // 构造本簇的全局 rank 列表（升序；索引 == homoRank）。
+  // clusterIdData 已在上面 allgather 过，因此每个 rank 都能独立算出本簇成员。
+  // 用途：簇内 CCL 初始化（HCCL HcclRootInfo 交换等）需要「簇作用域」的
+  // bootstrap 集合操作，而 bootstrap 的 peer/tag 是全局 rank —— 直接用簇内
+  // rank 会串到别的簇上。
+  (*comm)->homoRanksGlobalList.clear();
+  for (int i = 0; i < nranks; ++i) {
+    if (clusterIdData[i] == clusterIdData[rank]) {
+      (*comm)->homoRanksGlobalList.push_back(i);
+    }
+  }
+  INFO(FLAGCX_INIT, "homoRanksGlobalList size=%zu (homoRank=%d)",
+       (*comm)->homoRanksGlobalList.size(), (*comm)->homoRank);
 
   // fill clusterVendorMap
   FLAGCXCHECK(flagcxFillClusterVendorInfo(vendorData, (*comm), clusterIdData,
@@ -2228,9 +2280,12 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     }
   }
 
-  if ((!useHomoComm(*comm) || useHeteroComm()) && !useHostComm()) {
+  if ((!useHomoComm(*comm) || useHeteroComm()) && !useHostComm() &&
+      (*comm)->heteroComm->topoServer != NULL) {
     // Experimental for multi-nic support
     // Collect nic distance to ranks
+    // Kistich: skip when topo detection is disabled (topoServer == NULL);
+    // otherwise flagcxGetNicDistance dereferences NULL (topo.cc:422 crash).
     (*comm)->clusterInterRankList.resize((*comm)->nclusters);
     struct flagcxNicDistance *nicDistanceData;
     FLAGCXCHECK(flagcxCalloc(&nicDistanceData, nranks));

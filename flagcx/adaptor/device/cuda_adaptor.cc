@@ -4,7 +4,11 @@
 
 #include "adaptor.h"
 #include "alloc.h"
+#include "flagcx_kernel_internal.h" // flagcxLaunchCollectiveKernel（#7.2）
 #include "param.h"
+// 设备侧 reduce host 封装（实现于 adaptor/kernel/nvidia/flagcx_device_reduce.cu）
+extern "C" void flagcxLaunchReduceSum(void *dst, const void *src, size_t count,
+                           int datatype, void *stream);
 #include <mutex>
 #include <unistd.h>
 #include <unordered_map>
@@ -54,7 +58,10 @@ flagcxResult_t cudaAdaptorDeviceMalloc(void **ptr, size_t size,
                                        flagcxMemType_t type,
                                        flagcxStream_t stream) {
   if (type == flagcxMemHost) {
-    DEVCHECK(cudaHostAlloc(ptr, size, cudaHostAllocMapped));
+    // Kistich(fix-hetero-deadlock): plain pinned (no Mapped) — cudaMemcpy
+    // D2H into cudaHostAllocMapped memory intermittently blocks the proxy
+    // thread on 4090-1 driver. Plain pinned uses the standard D2H path.
+    DEVCHECK(cudaHostAlloc(ptr, size, cudaHostAllocPortable));
   } else if (type == flagcxMemManaged) {
     DEVCHECK(cudaMallocManaged(ptr, size, cudaMemAttachGlobal));
   } else {
@@ -110,6 +117,14 @@ flagcxResult_t cudaAdaptorHostGetDevicePointer(void **pDevice, void *pHost) {
   DEVCHECK(cudaHostGetDevicePointer(pDevice, pHost, 0));
   return flagcxSuccess;
 }
+
+flagcxResult_t cudaAdaptorReduceSum(void *dst, const void *src, size_t count,
+                                    flagcxDataType_t datatype,
+                                    flagcxStream_t stream) {
+  flagcxLaunchReduceSum(dst, src, count, (int)datatype, (void *)stream->base);
+  return flagcxSuccess;
+}
+
 
 flagcxResult_t cudaAdaptorGdrMemAlloc(void **ptr, size_t size,
                                       void *memHandle) {
@@ -935,6 +950,26 @@ flagcxResult_t cudaAdaptorGetLastError() {
   return err == cudaSuccess ? flagcxSuccess : flagcxSystemError;
 }
 
+#ifdef COMPILE_KERNEL_HOST
+// #7.2 CUDA 持久 collective kernel launch（DAG FIFO 消费方）。
+// 转调 flagcxCollectiveKernel<<<>>>（.cu 实现，异步 launch，kernel 驻留自旋
+// 消费 FIFO 直至 terminate）。仅在 COMPILE_KERNEL_HOST 下实现（符号来自
+// PLATFORM_KERNEL_SRCS 的 .cu 编译产物，未开 COMPILE_KERNEL 时不可链接）。
+flagcxResult_t cudaAdaptorLaunchCollectiveKernel(void *fifoBuffer,
+                                                 size_t nthreads,
+                                                 size_t nblocks,
+                                                 void *stream) {
+  flagcxLaunchCollectiveKernel(fifoBuffer, nthreads, nblocks,
+                               (flagcxStream_t)stream);
+  return flagcxSuccess;
+}
+#else
+flagcxResult_t cudaAdaptorLaunchCollectiveKernel(void *, size_t, size_t,
+                                                 void *) {
+  return flagcxNotSupported;
+}
+#endif // COMPILE_KERNEL_HOST
+
 struct flagcxDeviceAdaptor cudaAdaptor {
   "CUDA",
       // Basic functions
@@ -1002,6 +1037,9 @@ struct flagcxDeviceAdaptor cudaAdaptor {
       cudaAdaptorSymMulticastCreate, cudaAdaptorSymMulticastBind,
       cudaAdaptorSymMulticastTeardown, cudaAdaptorSymMulticastFree,
       cudaAdaptorGetLastError,
+      cudaAdaptorLaunchCollectiveKernel, // 持久 collective kernel launch
+                                         //（DAG FIFO 消费方，#7.2）
+      cudaAdaptorReduceSum,              // 设备侧 reduce（异构 allreduce）
 };
 
 #endif // USE_NVIDIA_ADAPTOR
