@@ -59,6 +59,17 @@ struct bootstrapState {
     struct bootstrapCollState *coll;
     struct bootstrapP2pState *p2p;
   };
+  // 簇内集合通信初始化期的「本簇全局 rank 列表」。
+  // bootstrap 的 peer/tag 一律是【全局 rank】，而簇内 CCL 初始化（例如 HCCL 的
+  // HcclRootInfo 交换）只能用【簇内序】(rank/nranks = homoRank/homoRanks) 去调用
+  // 集合操作。flagcxHomoCommInit 在调用 CCL 适配器的 commInitRank 之前填入本字段，
+  // 适配器据此构造 bootstrapCollIntraNodeBroadcast 的 ranks[]，避免把簇内 rank 当成
+  // 全局 rank 使用——否则在「集群数 ≥2 且某簇 rank 数 ≥2 且该簇全局基址 ≠ 0」时，
+  // bootstrapSend/Recv 的 peer 与 tag 会落在另一个簇上，造成串包。
+  // 索引 = homoRank，值为对应的全局 rank。NULL / clusterNranks==0 表示未设置，
+  // 调用方应退回「全局 rank 语义」的旧行为。
+  const int *clusterGlobalRanks;
+  int clusterNranks;
 };
 
 // ============================================================================

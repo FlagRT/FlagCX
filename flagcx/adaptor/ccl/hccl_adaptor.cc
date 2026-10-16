@@ -137,8 +137,20 @@ flagcxResult_t hcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
       }
       memcpy(&rootInfo, &t_hcclRootInfo, sizeof(HcclRootInfo));
     }
-    FLAGCXCHECK(bootstrapCollBroadcast(bootstrap, rank, nranks, 0, &rootInfo,
-                                       sizeof(HcclRootInfo)));
+    // bootstrap 的 peer/tag 一律是【全局 rank】。这里的 rank/nranks 是簇内序
+    // (homoRank/homoRanks)。bootstrapCollBroadcast 内部以 ranks==NULL 调用
+    // bootstrapCollIntraNodeBroadcast，会用普通下标当 peer/tag —— 在
+    // 「集群数 ≥2 且本簇全局基址 ≠ 0」时会把 root info 发到别的簇上，造成
+    // 串包、rootInfo 无效，HcclCommInitRootInfo 返回 HCCL_E_PARA。
+    // 因此优先使用 flagcxHomoCommInit 传入的本簇全局 rank 列表。
+    if (bootstrap->clusterNranks > 0 && bootstrap->clusterGlobalRanks != NULL) {
+      FLAGCXCHECK(bootstrapCollIntraNodeBroadcast(
+          bootstrap, const_cast<int *>(bootstrap->clusterGlobalRanks), rank,
+          nranks, 0, &rootInfo, sizeof(HcclRootInfo)));
+    } else {
+      FLAGCXCHECK(bootstrapCollBroadcast(bootstrap, rank, nranks, 0, &rootInfo,
+                                         sizeof(HcclRootInfo)));
+    }
   } else if (t_hasHcclRootInfo) {
     // No bootstrap available (e.g. single process): reuse thread-local root
     // info produced by hcclAdaptorGetUniqueId in the same process.

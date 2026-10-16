@@ -987,7 +987,6 @@ struct flagcxDeviceAdaptor cudaAdaptor {
       NULL, // flagcxResult_t (*gdrPtrMmap)(void **pcpuptr, void *devptr, size_t
             // sz);
       NULL, // flagcxResult_t (*gdrPtrMunmap)(void *cpuptr, size_t sz);
-      cudaAdaptorReduceSum,
       // Stream functions
       cudaAdaptorStreamCreate, cudaAdaptorStreamDestroy, cudaAdaptorStreamCopy,
       cudaAdaptorStreamFree, cudaAdaptorStreamSynchronize,
@@ -1040,6 +1039,7 @@ struct flagcxDeviceAdaptor cudaAdaptor {
       cudaAdaptorGetLastError,
       cudaAdaptorLaunchCollectiveKernel, // 持久 collective kernel launch
                                          //（DAG FIFO 消费方，#7.2）
+      cudaAdaptorReduceSum,              // 设备侧 reduce（异构 allreduce）
 };
 
 #endif // USE_NVIDIA_ADAPTOR

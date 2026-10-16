@@ -516,6 +516,32 @@ static flagcxResult_t cannAdaptorGetDevicePciBusId(char *pciBusId, int len,
   return flagcxSuccess;
 }
 
+// 反向查表：pciBusId -> 逻辑 device 下标。
+// 与 cannAdaptorGetDevicePciBusId 对称（后者在 sysfs 不可用时也生成伪 busId
+// "0000:80:xx.0"，因此这里逐设备比对即可覆盖两种情况）。
+// 背景：flagcx/core/topo.cc 的拓扑探测会调用 getDeviceByPciBusId，
+// 该回调不能留 NULL，否则昇腾侧一开拓扑探测就会空指针崩溃。
+static flagcxResult_t cannAdaptorGetDeviceByPciBusId(int *dev,
+                                                     const char *pciBusId) {
+  if (dev == NULL || pciBusId == NULL) {
+    return flagcxInvalidArgument;
+  }
+  int count = 0;
+  FLAGCXCHECK(cannAdaptorGetDeviceCount(&count));
+
+  char busId[64];
+  for (int d = 0; d < count; d++) {
+    busId[0] = '\0';
+    if (cannAdaptorGetDevicePciBusId(busId, sizeof(busId), d) != flagcxSuccess)
+      continue;
+    if (strcmp(busId, pciBusId) == 0) {
+      *dev = d;
+      return flagcxSuccess;
+    }
+  }
+  return flagcxInternalError;
+}
+
 struct flagcxDeviceAdaptor cannAdaptor {
   "CANN",
       // Basic functions
@@ -533,7 +559,6 @@ struct flagcxDeviceAdaptor cannAdaptor {
       NULL, // flagcxResult_t (*gdrPtrMmap)(void **pcpuptr, void *devptr, size_t
             // sz);
       NULL, // flagcxResult_t (*gdrPtrMunmap)(void *cpuptr, size_t sz);
-      cannAdaptorReduceSum,
       // Stream functions
       cannAdaptorStreamCreate, cannAdaptorStreamDestroy, cannAdaptorStreamCopy,
       cannAdaptorStreamFree, cannAdaptorStreamSynchronize,
@@ -561,9 +586,9 @@ struct flagcxDeviceAdaptor cannAdaptor {
             // *props, int dev);
       cannAdaptorGetDevicePciBusId, // flagcxResult_t (*getDevicePciBusId)(char
                                     // *pciBusId, int len, int dev);
-      NULL, // flagcxResult_t
-            // (*getDeviceByPciBusId)(int
-            // *dev, const char *pciBusId);
+      cannAdaptorGetDeviceByPciBusId, // flagcxResult_t
+                                      // (*getDeviceByPciBusId)(int
+                                      // *dev, const char *pciBusId);
       cannAdaptorLaunchHostFunc,
       // DMA buffer
       NULL, // flagcxResult_t (*dmaSupport)(bool *dmaBufferSupport);
@@ -580,6 +605,7 @@ struct flagcxDeviceAdaptor cannAdaptor {
       NULL, // flagcxResult_t (*getLastError)();
       cannAdaptorLaunchCollectiveKernel, // 持久 collective kernel launch
                                          //（DAG FIFO 消费方，#7.2）
+      cannAdaptorReduceSum,              // 设备侧 reduce（异构 allreduce）
 };
 
 #endif // USE_ASCEND_ADAPTOR

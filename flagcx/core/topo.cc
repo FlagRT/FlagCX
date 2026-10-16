@@ -679,7 +679,17 @@ flagcxResult_t flagcxTopoGetXmlTopo(struct flagcxHeteroComm *comm,
         continue;
       }
       int devLogicalIdx = 0;
-      deviceAdaptor->getDeviceByPciBusId(&devLogicalIdx, busId);
+      // 防御：多数非 CUDA 后端（CANN/HIP/IXCUDA/MUSA/MACA/MLU/TOPS/DUCUDA/
+      // Kunlunxin 等）在 device adaptor 表里把 getDeviceByPciBusId 留为 NULL，
+      // 而 device_plugin_load.cc 明确不对该字段做非空校验。无条件调用会导致
+      // 拓扑探测时空函数指针跳转（SIGSEGV）。
+      if (deviceAdaptor->getDeviceByPciBusId != NULL) {
+        deviceAdaptor->getDeviceByPciBusId(&devLogicalIdx, busId);
+      } else {
+        WARN("Topology detection: deviceAdaptor->getDeviceByPciBusId is NULL; "
+             "falling back to dev index 0 for busId [%s]",
+             busId);
+      }
       FLAGCXCHECK(xmlSetAttrInt(node, "dev", devLogicalIdx));
       FLAGCXCHECK(xmlSetAttrInt(node, "rank", r));
     }

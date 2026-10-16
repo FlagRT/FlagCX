@@ -1927,6 +1927,14 @@ flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
   // Pass the bootstrap state so the ccl adaptor can exchange
   // vendor-specific root info (e.g. 4108B HcclRootInfo) that does not
   // fit inside the 256B flagcxUniqueId.
+  // 同时把「本簇的全局 rank 列表」交给适配器：适配器内部的 bootstrap 集合操作
+  // 必须用全局 rank 做 peer/tag（nranks/rank 参数是簇内序，两者不能混用）。
+  if (state != NULL) {
+    state->clusterGlobalRanks = comm->homoRanksGlobalList.empty()
+                                    ? NULL
+                                    : comm->homoRanksGlobalList.data();
+    state->clusterNranks = (int)comm->homoRanksGlobalList.size();
+  }
   FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
       homoComm, comm->homoRanks, commId, comm->homoRank, state));
   return flagcxSuccess;
@@ -2057,6 +2065,20 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   (*comm)->homoRank = globalRankToHomoRankData[rank];
   (*comm)->clusterIds = clusterIdData;
   (*comm)->globalRank2HomoRank = globalRankToHomoRankData;
+
+  // 构造本簇的全局 rank 列表（升序；索引 == homoRank）。
+  // clusterIdData 已在上面 allgather 过，因此每个 rank 都能独立算出本簇成员。
+  // 用途：簇内 CCL 初始化（HCCL HcclRootInfo 交换等）需要「簇作用域」的
+  // bootstrap 集合操作，而 bootstrap 的 peer/tag 是全局 rank —— 直接用簇内
+  // rank 会串到别的簇上。
+  (*comm)->homoRanksGlobalList.clear();
+  for (int i = 0; i < nranks; ++i) {
+    if (clusterIdData[i] == clusterIdData[rank]) {
+      (*comm)->homoRanksGlobalList.push_back(i);
+    }
+  }
+  INFO(FLAGCX_INIT, "homoRanksGlobalList size=%zu (homoRank=%d)",
+       (*comm)->homoRanksGlobalList.size(), (*comm)->homoRank);
 
   // fill clusterVendorMap
   FLAGCXCHECK(flagcxFillClusterVendorInfo(vendorData, (*comm), clusterIdData,

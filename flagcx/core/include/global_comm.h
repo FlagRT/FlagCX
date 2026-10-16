@@ -98,6 +98,10 @@ struct flagcxComm {
   int homoInterMyRank;
   int homoInterRanks;
   std::vector<std::vector<int>> clusterInterRankList;
+  // 本簇（同 vendor / 同设备类型）的全局 rank 列表，升序；索引 == homoRank。
+  // 供簇内 CCL 初始化期做「簇作用域」的 bootstrap 集合操作使用
+  // （bootstrap 的 peer/tag 是全局 rank，不能用簇内序）。
+  std::vector<int> homoRanksGlobalList;
   std::vector<flagcxVendorType> clusterVendorMap;
   struct flagcxTuner *tuner;
   void *tunerContext;
