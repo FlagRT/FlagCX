@@ -4,7 +4,13 @@
  * Copyright (c) 2025 by DU. All Rights Reserved.
  ************************************************************************/
 #include "backend_flagcx.hpp"
+#ifdef USE_NVIDIA_ADAPTOR
+// 只有 NVIDIA 线需要（使用点见 getStreamByIndex 的
+// at::cuda::getCurrentCUDAStream）。**不得无条件包含**：纯昇腾栈
+// （torch 2.10.0+cpu + torch_npu）里没有 cuda_runtime_api.h，
+// 无条件包含会让 `USE_ASCEND=1 pip install .` 在编译期直接失败。
 #include <ATen/cuda/CUDAContext.h>
+#endif
 #include <dlfcn.h>
 #include <c10/core/DeviceGuard.h>
 #include "utils_flagcx.hpp"
