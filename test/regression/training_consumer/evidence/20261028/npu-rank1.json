@@ -1,0 +1,40 @@
+{
+  "rank": 1,
+  "backend": "flagcx",
+  "torch": "2.10.0+cpu",
+  "scope": "NPU integration",
+  "provenance": {
+    "package": "/workspace/FlagCX/plugin/torch/flagcx/__init__.py",
+    "extension_sha256": "b189f3fe2df5791b2c2014bd531ffefd1080520a330ee252f213d4b8ba5f1343"
+  },
+  "cycles": [
+    {
+      "index": 0,
+      "checks": 1011,
+      "failures": [],
+      "ddp_steps": 10,
+      "teardown": "closed",
+      "initial_parameter_sha256": "dfd22329272191512d0078da5f5dc42f3287c817c8f5b80505d8b6a5444ccb16",
+      "final_parameter_sha256": "cf21a25187bd720843ffae49705acf4910a0fc1c484db72341ef561b4c47c72c"
+    },
+    {
+      "index": 1,
+      "checks": 1011,
+      "failures": [],
+      "ddp_steps": 10,
+      "teardown": "closed",
+      "initial_parameter_sha256": "1f5862e3782feb34ad474018ce4429a0ee6084fa6bc0975c03aeab5518f2683a",
+      "final_parameter_sha256": "f5c4e80ece74a1c1d3b134d62a206b1e43d097f0cf94a733c46896702d63d72c"
+    },
+    {
+      "index": 2,
+      "checks": 1011,
+      "failures": [],
+      "ddp_steps": 10,
+      "teardown": "closed",
+      "initial_parameter_sha256": "489f9c138807833557bec65f88500aa6984cd88cfff3e8460ac991e2b1489bc5",
+      "final_parameter_sha256": "0c0224e6c4db51d0748362b1b17339b4725bfc8e2e4d74612cee4e7736ee6ea8"
+    }
+  ],
+  "verdict": "PASS"
+}
