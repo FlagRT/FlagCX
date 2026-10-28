@@ -7,6 +7,7 @@
     "package": "/workspace/FlagCX/plugin/torch/flagcx/__init__.py",
     "extension_sha256": "b189f3fe2df5791b2c2014bd531ffefd1080520a330ee252f213d4b8ba5f1343"
   },
+  "worker_sha256": "d4d0778974497d86ace2e1b3bd265ecf7c17edea930957414f5efe974fd91997",
   "cycles": [
     {
       "index": 0,
@@ -36,5 +37,6 @@
       "final_parameter_sha256": "0c0224e6c4db51d0748362b1b17339b4725bfc8e2e4d74612cee4e7736ee6ea8"
     }
   ],
-  "verdict": "PASS"
+  "verdict": "PASS",
+  "lifecycle_protocol": "unique PrefixStore per cycle; host Store rendezvous after destroy"
 }
