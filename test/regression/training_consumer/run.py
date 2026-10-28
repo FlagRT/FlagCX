@@ -1,5 +1,6 @@
 """Single entry retaining launcher exits, including native teardown failures."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,7 +39,8 @@ def main():
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid,signal.SIGKILL); code=process.wait()
     result=dict(argv=command,exit_code=code,timed_out=timed_out,seconds=time.time()-start,
-                verdict='ERROR',backend=a.backend,cycles=a.cycles,iters=a.iters)
+                verdict='ERROR',backend=a.backend,cycles=a.cycles,iters=a.iters,
+                launcher_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     try:
         ranks=[json.loads((a.output/f'rank{rank}.json').read_text()) for rank in range(2)]
         checks={'launcher_zero':code==0 and not timed_out}
@@ -51,6 +53,7 @@ def main():
             checks[f'rank{rank}_checks']=all(c['checks']==expected_per_cycle and not c['failures']
                                              and c['ddp_steps']==10 for c in r['cycles'])
         checks['same_binary']=ranks[0]['provenance']==ranks[1]['provenance']
+        checks['same_worker']=bool(ranks[0].get('worker_sha256')) and ranks[0].get('worker_sha256')==ranks[1].get('worker_sha256')
         checks['ddp_parameters_match']=len(ranks[0]['cycles'])==len(ranks[1]['cycles']) and all(
             x.get('final_parameter_sha256')==y.get('final_parameter_sha256')
             and x.get('initial_parameter_sha256')==y.get('initial_parameter_sha256')
@@ -61,6 +64,7 @@ def main():
         verdict='PASS' if all(checks.values()) else ('ERROR' if incomplete and not assertion_failure else 'FAIL')
         result.update(checks=checks,checks_per_rank=sum(c['checks'] for c in ranks[0]['cycles']),
                       provenance=ranks[0]['provenance'],
+                      worker_sha256=ranks[0].get('worker_sha256'),
                       verdict=verdict)
     except (KeyError,FileNotFoundError,ValueError,TypeError) as error:
         result['reason']=str(error)

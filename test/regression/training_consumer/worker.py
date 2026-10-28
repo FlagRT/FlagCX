@@ -47,17 +47,28 @@ def main():
         device, stream_modes, provenance = torch.device('cpu'), ['default'], {}
     result = dict(rank=rank, backend=a.backend, torch=torch.__version__,
                   scope='NPU integration' if a.backend=='flagcx' else 'CPU/Gloo host control',
-                  provenance=provenance, cycles=[], verdict='ERROR')
+                  provenance=provenance, worker_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  cycles=[], verdict='ERROR')
     target = a.output/f'rank{rank}.json'
     if target.exists():
         raise FileExistsError(target)
     def save():
         target.write_text(json.dumps(result, indent=2)+'\n')
+    save()
     try:
+        # Reinitialization requires coordination outside the destroyed process
+        # group. torchrun's agent store also survives group destruction; give
+        # each cycle a fresh namespace so stale bootstrap IDs cannot be reused.
+        control = dist.TCPStore(os.environ['MASTER_ADDR'], int(os.environ['MASTER_PORT']),
+                                is_master=False, timeout=timedelta(seconds=90))
+        result['lifecycle_protocol'] = 'unique PrefixStore per cycle; host Store rendezvous after destroy'
         for cycle in range(a.cycles):
-            dist.init_process_group(a.backend, timeout=timedelta(seconds=90))
+            store = dist.PrefixStore(f'training-consumer/cycle-{cycle}/', control)
+            dist.init_process_group(a.backend, store=store, rank=rank, world_size=2,
+                                    timeout=timedelta(seconds=90))
             record = dict(index=cycle, checks=0, failures=[], ddp_steps=0, teardown='pending')
             result['cycles'].append(record)
+            save()
             def check(ok, label):
                 record['checks'] += 1
                 if not ok and len(record['failures']) < 10:
@@ -91,6 +102,7 @@ def main():
                             observed = [x.clone() for x in outputs]
                             check(all(torch.equal(x.cpu(), torch.full((257,), float(step+r+cycle)))
                                       for r,x in enumerate(observed)), f'all_gather/{mode}/{step}')
+                    save()  # Preserve peer evidence if native DDP startup aborts another rank.
                 torch.manual_seed(4321+cycle)
                 model = torch.nn.Linear(4, 2).to(device)
                 initial = digest(model)
@@ -114,6 +126,9 @@ def main():
                 dist.destroy_process_group()
                 record['teardown'] = 'closed'
                 save()
+            control.set(f'training-consumer/closed-{cycle}-{rank}', '1')
+            control.wait([f'training-consumer/closed-{cycle}-{r}' for r in range(2)],
+                         timedelta(seconds=90))
             if record['failures']:
                 result['verdict'] = 'FAIL'
                 break

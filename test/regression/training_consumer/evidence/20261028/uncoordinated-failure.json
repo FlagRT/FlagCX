@@ -1,0 +1,51 @@
+{
+  "argv": [
+    "/usr/local/python3.11.15/bin/python3",
+    "-m",
+    "torch.distributed.run",
+    "--nnodes=1",
+    "--nproc_per_node=2",
+    "--rdzv_backend=static",
+    "--master_addr=127.0.0.1",
+    "--master_port=52627",
+    "/workspace/flagcx-tests/worker.py",
+    "--backend",
+    "flagcx",
+    "--output",
+    "evidence/flagcx-stream-reuse-final",
+    "--cycles",
+    "3",
+    "--iters",
+    "50"
+  ],
+  "exit_code": 1,
+  "timed_out": false,
+  "seconds": 45.67393636703491,
+  "verdict": "FAIL",
+  "backend": "flagcx",
+  "cycles": 3,
+  "iters": 50,
+  "launcher_sha256": "9f265b0816e263eb1fbb70c8f9f4b8798ecce6d8604a8cafa25877641faebbd5",
+  "checks": {
+    "launcher_zero": false,
+    "rank0_identity": true,
+    "rank0_passed": false,
+    "rank0_cycles": true,
+    "rank0_closed": false,
+    "rank0_checks": false,
+    "rank1_identity": true,
+    "rank1_passed": false,
+    "rank1_cycles": true,
+    "rank1_closed": true,
+    "rank1_checks": false,
+    "same_binary": true,
+    "same_worker": true,
+    "ddp_parameters_match": true
+  },
+  "checks_per_rank": 2022,
+  "provenance": {
+    "package": "/workspace/FlagCX/plugin/torch/flagcx/__init__.py",
+    "extension_sha256": "b189f3fe2df5791b2c2014bd531ffefd1080520a330ee252f213d4b8ba5f1343"
+  },
+  "worker_sha256": "726117bb57c9afd527efee1bf161fbd2e58322119c6df67471a07d4b720f25c4"
+}

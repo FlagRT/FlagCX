@@ -1,0 +1,29 @@
+{
+  "argv": [
+    "/usr/local/python3.11.15/bin/python3",
+    "-m",
+    "torch.distributed.run",
+    "--nnodes=1",
+    "--nproc_per_node=2",
+    "--rdzv_backend=static",
+    "--master_addr=127.0.0.1",
+    "--master_port=52269",
+    "/workspace/flagcx-tests/worker.py",
+    "--backend",
+    "flagcx",
+    "--output",
+    "evidence/flagcx-old-negative",
+    "--cycles",
+    "1",
+    "--iters",
+    "4"
+  ],
+  "exit_code": 1,
+  "timed_out": false,
+  "seconds": 20.193905115127563,
+  "verdict": "ERROR",
+  "backend": "flagcx",
+  "cycles": 1,
+  "iters": 4,
+  "reason": "[Errno 2] No such file or directory: 'evidence/flagcx-old-negative/rank1.json'"
+}
