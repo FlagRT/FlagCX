@@ -1,0 +1,32 @@
+{
+  "rank": 0,
+  "torch": "2.9.0+cu129",
+  "checks": [
+    {
+      "mode": "explicit",
+      "name": "weight",
+      "max_abs": 5.960464477539063e-08,
+      "passed": true
+    },
+    {
+      "mode": "explicit",
+      "name": "bias",
+      "max_abs": 5.960464477539063e-08,
+      "passed": true
+    },
+    {
+      "mode": "native",
+      "name": "weight",
+      "max_abs": 0.36765897274017334,
+      "passed": false
+    },
+    {
+      "mode": "native",
+      "name": "bias",
+      "max_abs": 0.4449141323566437,
+      "passed": false
+    }
+  ],
+  "verdict": "FAIL",
+  "closed": true
+}
