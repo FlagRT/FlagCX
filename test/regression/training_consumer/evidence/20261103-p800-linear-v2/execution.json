@@ -1,0 +1,13 @@
+{
+  "exit_code": 1,
+  "started_at": 1793769636.36862,
+  "seconds": 18.252873182296753,
+  "argv": [
+    "ssh",
+    "-p",
+    "26008",
+    "lianzhongyou@81.70.153.29",
+    "python3 -c 'import sys;sys.path.insert(0,\"/data2/lianzhongyou/runtime-tests/20261103-communication/dev/communication/training\");from run_p800_selected import snapshot;f=snapshot()[1];assert 4 in f and 5 in f' && docker start flagrt-communication-p800-pair-1028 && docker exec flagrt-communication-p800-pair-1028 timeout --kill-after=10s 90s /root/miniconda/envs/python310_torch29_cuda/bin/python3 -m torch.distributed.run --nnodes=1 --nproc_per_node=2 --master_port=29597 /workspace/kunlun_ddp_oracle.py --output /workspace/evidence/library-ddp-oracle-v2"
+  ],
+  "source_sha256": "b31434f797cbe0fa9476c1ddd154835411743e5a5a2db443ad6b7e0d2f418e1e"
+}
